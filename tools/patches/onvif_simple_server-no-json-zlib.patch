@@ -42,6 +42,18 @@ index df2945b..e7de449 100644
 -#define DEFAULT_LOG_FILE "/var/log/onvif_simple_server.log"
 +#define DEFAULT_LOG_FILE "/tmp/mnt/sdcard/logs/onvif_simple_server.log"
  #define DEBUG_FILE "/tmp/onvif_simple_server.debug"
+diff --git a/onvif_notify_server.c b/onvif_notify_server.c
+index b829f2f..d637310 100644
+--- a/onvif_notify_server.c
++++ b/onvif_notify_server.c
+@@ -43,6 +43,6 @@
+ #define DEFAULT_CONF_FILE "/etc/onvif_simple_server.conf"
+ #define DEFAULT_JSON_CONF_FILE "/etc/onvif_simple_server.json"
+-#define DEFAULT_LOG_FILE "/var/log/onvif_notify_server.log"
++#define DEFAULT_LOG_FILE "/tmp/mnt/sdcard/logs/onvif_notify_server.log"
+ #define DEFAULT_PID_FILE "/var/run/onvif_notify_server.pid"
+ #define DEFAULT_TEMPLATE_DIR "/etc/onvif_notify_server"
+ #define INOTIFY_DIR "/tmp/onvif_notify_server"
 diff --git a/utils.c b/utils.c
 index dbef6e0..0082961 100644
 --- a/utils.c

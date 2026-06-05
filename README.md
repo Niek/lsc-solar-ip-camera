@@ -74,6 +74,7 @@ This builds:
 - `onvif_cgi_httpd`: small HTTP wrapper for ONVIF SOAP requests.
 - `patch_stone_main`: patches the copied Tuya binary to keep Linux awake.
 - `onvif_simple_server`: handles ONVIF device/media SOAP calls.
+- `onvif_notify_server`: tracks ONVIF event state for PullPoint subscriptions.
 - `wsd_simple_server`: announces the camera via ONVIF WS-Discovery.
 
 The build script fetches pinned upstream sources for
@@ -138,14 +139,15 @@ The SD bootstrap currently:
 - keeps `/config/fmode` asserted
 - starts telnet on port `2323`
 - starts the RTSP relay on port `8554`
-- starts ONVIF HTTP and WS-Discovery
+- starts ONVIF HTTP, WS-Discovery, and motion-event notification
+- feeds ONVIF motion from the RTSP relay's encoded-frame motion fallback
 - applies AIC TCP forwarding filters
 - starts the original Tuya process from `factory/stone-main.bin`
-- sets these Tuya config values to `0`:
-  - `tuya_hum_on_off`
-  - `tuya_pir_on_off`
-  - `tuya_flip_onoff`
-  - `tuya_watermark_onoff`
+- sets these Tuya config values:
+  - `tuya_hum_on_off=0`
+  - `tuya_pir_on_off=1`
+  - `tuya_flip_onoff=0`
+  - `tuya_watermark_onoff=0`
 
 ## Repository layout
 

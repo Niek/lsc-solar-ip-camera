@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdint.h>
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,6 +22,9 @@
 #define ONVIF_ROOT "/tmp/mnt/sdcard/custom/onvif"
 #define ONVIF_CGI "/tmp/mnt/sdcard/custom/bin/onvif_simple_server"
 #define ONVIF_CONF "/tmp/mnt/sdcard/custom/onvif/onvif_simple_server.conf"
+#define IMPDBG "/usr/bin/impdbg"
+/* impdbg --save_pic faults on longer SD-card paths; keep this tmpfs path short. */
+#define SNAPSHOT_FILE "/tmp/onvif.raw"
 
 static int write_all(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
@@ -171,17 +176,86 @@ static int extract_service(const char *path, char *service, size_t service_len) 
     return valid_service(service) ? 0 : -1;
 }
 
+static int refresh_snapshot(void) {
+    pid_t pid;
+    int status;
+    int attempt;
+
+    unlink(SNAPSHOT_FILE);
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execl(IMPDBG, "impdbg", "--save_pic", SNAPSHOT_FILE, (char *)NULL);
+        _exit(127);
+    }
+
+    for (attempt = 0; attempt < 50; attempt++) {
+        pid_t done = waitpid(pid, &status, WNOHANG);
+
+        if (done == pid) {
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+        }
+        if (done < 0 && errno != EINTR) {
+            return -1;
+        }
+        usleep(100000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    return -1;
+}
+
+static void send_snapshot(int client_fd) {
+    int fd;
+    struct stat st;
+    char buf[4096];
+    ssize_t n;
+
+    if (refresh_snapshot() != 0) {
+        send_response(client_fd, "502 Bad Gateway", "text/plain", "snapshot capture failed\n");
+        return;
+    }
+
+    fd = open(SNAPSHOT_FILE, O_RDONLY);
+    if (fd < 0 || fstat(fd, &st) < 0 || st.st_size <= 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        send_response(client_fd, "404 Not Found", "text/plain", "snapshot not ready\n");
+        return;
+    }
+
+    dprintf(client_fd,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %ld\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n",
+            (long)st.st_size);
+
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        if (write_all(client_fd, buf, (size_t)n) < 0) {
+            break;
+        }
+    }
+    close(fd);
+}
+
 static void set_cgi_env(const char *method, const char *path, const char *service,
                         long content_length, const struct sockaddr_in *peer) {
     char length[32];
     char script_name[128];
     char remote_addr[64];
     char remote_port[16];
+    const char *query;
 
     snprintf(length, sizeof(length), "%ld", content_length);
     snprintf(script_name, sizeof(script_name), "/onvif/%s", service);
     snprintf(remote_port, sizeof(remote_port), "%u", ntohs(peer->sin_port));
     inet_ntop(AF_INET, &peer->sin_addr, remote_addr, sizeof(remote_addr));
+    query = strchr(path, '?');
 
     setenv("REQUEST_METHOD", method, 1);
     setenv("REQUEST_URI", path, 1);
@@ -196,7 +270,7 @@ static void set_cgi_env(const char *method, const char *path, const char *servic
     setenv("SERVER_SOFTWARE", "t23-onvif-cgi-httpd", 1);
     setenv("REMOTE_ADDR", remote_addr, 1);
     setenv("REMOTE_PORT", remote_port, 1);
-    setenv("QUERY_STRING", "", 1);
+    setenv("QUERY_STRING", query == NULL ? "" : query + 1, 1);
 }
 
 static int read_cgi_output(int fd, char **out, size_t *out_len) {
@@ -395,6 +469,10 @@ static void handle_client(int client_fd, const struct sockaddr_in *peer) {
         return;
     }
     (void)version;
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/snapshot.jpg") == 0) {
+        send_snapshot(client_fd);
+        return;
+    }
     if (strcmp(method, "POST") != 0) {
         send_response(client_fd, "405 Method Not Allowed", "text/plain", "POST required\n");
         return;
@@ -498,6 +576,7 @@ int main(int argc, char **argv) {
         pid = fork();
         if (pid == 0) {
             close(listen_fd);
+            signal(SIGCHLD, SIG_DFL);
             handle_client(client_fd, &peer);
             close(client_fd);
             _exit(0);

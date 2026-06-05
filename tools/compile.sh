@@ -105,6 +105,17 @@ docker "${run_args[@]}" "$IMAGE" sh -eu -c '
       log.o ezxml_wrapper.o ezxml.o -lmbedcrypto -lpthread -lrt
 
     rm -f *.o
+    notify_sources="onvif_notify_server.c conf.c utils.c log.c ezxml_wrapper.c ezxml/ezxml.c"
+    for src in $notify_sources; do
+      obj="$(basename "${src%.c}").o"
+      "$cc" $cflags -c "../../third_party/onvif_simple_server/$src" -o "$obj"
+    done
+    "$cc" -static -Os -s -Wl,--gc-sections \
+      -o ../bin/onvif_notify_server \
+      onvif_notify_server.o conf.o utils.o log.o ezxml_wrapper.o ezxml.o \
+      -lmbedcrypto -lpthread -lrt
+
+    rm -f *.o
     wsd_sources="wsd_simple_server.c utils.c log.c ezxml_wrapper.c ezxml/ezxml.c"
     for src in $wsd_sources; do
       obj="$(basename "${src%.c}").o"
@@ -120,5 +131,6 @@ docker "${run_args[@]}" "$IMAGE" sh -eu -c '
   file build/mipsel/bin/onvif_cgi_httpd
   file build/mipsel/bin/patch_stone_main
   file build/mipsel/bin/onvif_simple_server
+  file build/mipsel/bin/onvif_notify_server
   file build/mipsel/bin/wsd_simple_server
 '

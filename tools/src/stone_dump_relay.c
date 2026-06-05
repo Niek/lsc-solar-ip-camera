@@ -23,6 +23,8 @@
 #define DUMP_DIR "/mnt/mountdir"
 #define DUMP_PATH "/mnt/mountdir/dump.bs"
 #define TRUNCATE_AFTER (512 * 1024)
+#define MOTION_FILE "/tmp/onvif_notify_server/motion_alarm"
+#define MOTION_LOG "/tmp/mnt/sdcard/logs/video_motion.log"
 
 #define RTSP_SESSION "12345678"
 #define RTP_PAYLOAD_TYPE 96
@@ -31,6 +33,14 @@
 #define VIDEO_FPS 15U
 #define RTP_TS_STEP (RTP_CLOCK / VIDEO_FPS)
 #define NAL_BUFFER_SIZE (1024 * 1024)
+#define MOTION_WARMUP_FRAMES 120U
+#define MOTION_HOLD_SECONDS 8
+#define MOTION_MIN_SAMPLE_BYTES 10000U
+#define MOTION_ABS_DELTA_BYTES 5000U
+#define LISTEN_BACKLOG 8
+#define CLIENT_IO_TIMEOUT_SECONDS 5
+#define STREAM_COUNT_LOCK_PATH "/tmp/stone_dump_relay.stream_count.lock"
+#define STREAM_COUNT_PATH "/tmp/stone_dump_relay.stream_count"
 
 typedef struct {
     int fd;
@@ -41,6 +51,13 @@ typedef struct {
     SocketWriter writer;
     SmolRTSP_NalTransport *nal_transport;
 } RtspSink;
+
+typedef struct {
+    unsigned int samples;
+    uint32_t ema_q8;
+    time_t active_until;
+    int active;
+} MotionDetector;
 
 static int send_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -60,6 +77,70 @@ static int send_all(int fd, const void *buf, size_t len) {
         pos += (size_t)n;
     }
     return 0;
+}
+
+static void motion_log(const char *state, size_t sample, uint32_t avg) {
+    FILE *fp = fopen(MOTION_LOG, "a");
+    time_t now;
+
+    if (fp == NULL) {
+        return;
+    }
+    now = time(NULL);
+    fprintf(fp, "%ld %s sample=%lu avg=%lu\n", (long)now, state,
+            (unsigned long)sample, (unsigned long)avg);
+    fclose(fp);
+}
+
+static void set_motion_file(int active, size_t sample, uint32_t avg) {
+    if (active) {
+        int fd;
+        mkdir("/tmp/onvif_notify_server", 0777);
+        fd = open(MOTION_FILE, O_CREAT | O_WRONLY, 0666);
+        if (fd >= 0) {
+            close(fd);
+        }
+        motion_log("motion-on", sample, avg);
+    } else {
+        unlink(MOTION_FILE);
+        motion_log("motion-off", sample, avg);
+    }
+}
+
+static void motion_detector_update(MotionDetector *det, size_t sample) {
+    uint32_t avg;
+    size_t threshold;
+    time_t now;
+
+    if (sample == 0) {
+        return;
+    }
+
+    now = time(NULL);
+    if (det->active && now >= det->active_until) {
+        det->active = 0;
+        set_motion_file(0, sample, det->ema_q8 >> 8);
+    }
+
+    if (det->ema_q8 == 0) {
+        det->ema_q8 = (uint32_t)sample << 8;
+    }
+    avg = det->ema_q8 >> 8;
+    threshold = (size_t)avg + (avg / 3U) + MOTION_ABS_DELTA_BYTES;
+
+    if (det->samples >= MOTION_WARMUP_FRAMES &&
+        sample > MOTION_MIN_SAMPLE_BYTES && sample > threshold) {
+        det->active_until = now + MOTION_HOLD_SECONDS;
+        if (!det->active) {
+            det->active = 1;
+            set_motion_file(1, sample, avg);
+        }
+    }
+
+    if (det->samples < MOTION_WARMUP_FRAMES || !det->active) {
+        det->ema_q8 = ((det->ema_q8 * 15U) + ((uint32_t)sample << 8)) / 16U;
+    }
+    det->samples++;
 }
 
 static ssize_t SocketWriter_write(VSelf, CharSlice99 data) {
@@ -155,12 +236,74 @@ static int make_server(int port) {
         close(fd);
         return -1;
     }
-    if (listen(fd, 1) < 0) {
+    if (listen(fd, LISTEN_BACKLOG) < 0) {
         perror("listen");
         close(fd);
         return -1;
     }
     return fd;
+}
+
+static void set_client_timeouts(int fd) {
+    struct timeval tv;
+
+    tv.tv_sec = CLIENT_IO_TIMEOUT_SECONDS;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static int lock_count_fd(int fd) {
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    return fcntl(fd, F_SETLKW, &fl);
+}
+
+static int update_stream_count(int delta) {
+    char buf[32];
+    int lock_fd;
+    int count_fd;
+    int count = 0;
+    ssize_t n;
+
+    lock_fd = open(STREAM_COUNT_LOCK_PATH, O_CREAT | O_RDWR, 0666);
+    if (lock_fd < 0) {
+        perror("open stream count lock");
+        return 1;
+    }
+    if (lock_count_fd(lock_fd) < 0) {
+        perror("stream count lock");
+        close(lock_fd);
+        return 1;
+    }
+
+    count_fd = open(STREAM_COUNT_PATH, O_CREAT | O_RDWR, 0666);
+    if (count_fd >= 0) {
+        n = read(count_fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            count = atoi(buf);
+        }
+    }
+
+    count += delta;
+    if (count < 0) {
+        count = 0;
+    }
+    if (count_fd >= 0) {
+        snprintf(buf, sizeof(buf), "%d\n", count);
+        lseek(count_fd, 0, SEEK_SET);
+        ftruncate(count_fd, 0);
+        if (write(count_fd, buf, strlen(buf)) < 0) {
+            perror("write stream count");
+        }
+        close(count_fd);
+    }
+
+    close(lock_fd);
+    return count;
 }
 
 static int client_closed(int fd) {
@@ -187,8 +330,7 @@ static int create_trigger(void) {
     int fd;
 
     mkdir(DUMP_DIR, 0777);
-    unlink(DUMP_PATH);
-    fd = open(DUMP_PATH, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    fd = open(DUMP_PATH, O_CREAT | O_RDWR, 0666);
     if (fd < 0) {
         perror("open dump trigger");
         return -1;
@@ -232,9 +374,12 @@ static void relay_raw_client(int cfd) {
     if (create_trigger() < 0) {
         return;
     }
+    update_stream_count(1);
     dfd = reopen_dump(-1);
     if (dfd < 0) {
-        unlink(DUMP_PATH);
+        if (update_stream_count(-1) == 0) {
+            unlink(DUMP_PATH);
+        }
         return;
     }
 
@@ -287,7 +432,9 @@ static void relay_raw_client(int cfd) {
     if (dfd >= 0) {
         close(dfd);
     }
-    unlink(DUMP_PATH);
+    if (update_stream_count(-1) == 0) {
+        unlink(DUMP_PATH);
+    }
     printf("raw client disconnected\n");
 }
 
@@ -549,8 +696,8 @@ static ssize_t find_start_code(const unsigned char *buf, size_t len, size_t from
     return -1;
 }
 
-static int process_nal_buffer(RtspSink *sink, unsigned char *buf, size_t *len,
-                              uint32_t *timestamp) {
+static int process_nal_buffer(RtspSink *sink, MotionDetector *motion,
+                              unsigned char *buf, size_t *len, uint32_t *timestamp) {
     for (;;) {
         size_t first_len = 0;
         size_t next_len = 0;
@@ -584,6 +731,9 @@ static int process_nal_buffer(RtspSink *sink, unsigned char *buf, size_t *len,
 
         if (nal_len > 0) {
             nal_type = buf[nal_start] & 0x1f;
+            if (nal_type == SMOLRTSP_H264_NAL_UNIT_CODED_SLICE_NON_IDR) {
+                motion_detector_update(motion, nal_len);
+            }
             if (send_h264_nal(sink, *timestamp, buf + nal_start, nal_len) < 0) {
                 return -1;
             }
@@ -666,17 +816,22 @@ static int rtsp_stream_control(RtspSink *sink) {
 static int stream_rtsp_h264(RtspSink *sink) {
     unsigned char read_buf[8192];
     unsigned char nal_buf[NAL_BUFFER_SIZE];
+    MotionDetector motion;
     size_t nal_len = 0;
     int dfd = -1;
     off_t offset = 0;
     uint32_t timestamp = (uint32_t)time(NULL) * RTP_CLOCK;
 
+    memset(&motion, 0, sizeof(motion));
     if (create_trigger() < 0) {
         return -1;
     }
+    update_stream_count(1);
     dfd = reopen_dump(-1);
     if (dfd < 0) {
-        unlink(DUMP_PATH);
+        if (update_stream_count(-1) == 0) {
+            unlink(DUMP_PATH);
+        }
         return -1;
     }
 
@@ -717,7 +872,7 @@ static int stream_rtsp_h264(RtspSink *sink) {
                 memcpy(nal_buf + nal_len, read_buf, (size_t)n);
                 nal_len += (size_t)n;
                 offset += n;
-                if (process_nal_buffer(sink, nal_buf, &nal_len, &timestamp) < 0) {
+                if (process_nal_buffer(sink, &motion, nal_buf, &nal_len, &timestamp) < 0) {
                     break;
                 }
             }
@@ -736,7 +891,12 @@ static int stream_rtsp_h264(RtspSink *sink) {
     if (dfd >= 0) {
         close(dfd);
     }
-    unlink(DUMP_PATH);
+    if (motion.active) {
+        set_motion_file(0, 0, motion.ema_q8 >> 8);
+    }
+    if (update_stream_count(-1) == 0) {
+        unlink(DUMP_PATH);
+    }
     return 0;
 }
 
@@ -788,7 +948,6 @@ static void handle_rtsp_client(int cfd, const struct sockaddr_in *peer) {
     }
 
     rtsp_sink_close(&sink);
-    unlink(DUMP_PATH);
     printf("smolrtsp client disconnected\n");
 }
 
@@ -803,6 +962,7 @@ static void accept_raw(int sfd) {
         }
         return;
     }
+    set_client_timeouts(cfd);
     relay_raw_client(cfd);
     close(cfd);
 }
@@ -811,6 +971,7 @@ static void accept_rtsp(int sfd) {
     struct sockaddr_in peer;
     socklen_t peer_len = sizeof(peer);
     int cfd = accept(sfd, (struct sockaddr *)&peer, &peer_len);
+    pid_t pid;
 
     if (cfd < 0) {
         if (errno != EINTR) {
@@ -818,7 +979,19 @@ static void accept_rtsp(int sfd) {
         }
         return;
     }
-    handle_rtsp_client(cfd, &peer);
+    set_client_timeouts(cfd);
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        close(cfd);
+        return;
+    }
+    if (pid == 0) {
+        close(sfd);
+        handle_rtsp_client(cfd, &peer);
+        close(cfd);
+        _exit(0);
+    }
     close(cfd);
 }
 
@@ -827,9 +1000,12 @@ int main(void) {
     int rtsp_sfd;
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
     srand((unsigned)time(NULL));
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    unlink(STREAM_COUNT_PATH);
+    unlink(DUMP_PATH);
 
     raw_sfd = make_server(RAW_PORT);
     rtsp_sfd = make_server(RTSP_PORT);

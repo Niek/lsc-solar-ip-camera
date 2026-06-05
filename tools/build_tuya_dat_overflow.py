@@ -50,6 +50,7 @@ log "start"
 [ -x "$PATCHER" ] || fail "missing patcher: $PATCHER"
 
 if [ -x "$DST" ] && "$PATCHER" --check "$DST" >> "$LOG" 2>&1; then
+    "$PATCHER" "$DST" >> "$LOG" 2>&1 || fail "patch failed for existing $DST"
     log "existing $DST is usable"
 else
     src="$(find_stone_exe)" || fail "could not find running Tuya executable via /proc"
@@ -75,6 +76,7 @@ T23_ENTRYPOINT = """#!/bin/sh
 SD=/tmp/mnt/sdcard
 LOGDIR="$SD/logs"
 LOG="$LOGDIR/t23-entrypoint.log"
+PATCHER="$SD/custom/bin/patch_stone_main"
 
 mkdir -p "$LOGDIR" >/dev/null 2>&1 || true
 : > "$LOG" 2>/dev/null || LOG=/dev/null
@@ -87,14 +89,14 @@ STONE_MAIN=/tmp/mnt/sdcard/factory/stone-main.bin
 TELNET_PORT=2323
 ONVIF_PORT=8899
 TUYA_HUM_ON_OFF=0
-TUYA_PIR_ON_OFF=0
+TUYA_PIR_ON_OFF=1
 TUYA_FLIP_ONOFF=0
 TUYA_WATERMARK_ONOFF=0
 AIC_FILTER_SECONDS=90
 
 echo t23-entrypoint-start > /dev/console
 log "start"
-for run_log in stone-main.log telnetd.log aic_filter.log stream_relay.log onvif_httpd.log wsd_simple_server.log onvif_simple_server.log; do
+for run_log in stone-main.log telnetd.log aic_filter.log stream_relay.log onvif_httpd.log wsd_simple_server.log onvif_simple_server.log onvif_notify_server.log video_motion.log; do
     : > "$LOGDIR/$run_log" 2>/dev/null || true
 done
 log "reset per-run logs"
@@ -157,7 +159,9 @@ start_stream_relay() {
 start_onvif() {
     httpd="$SD/custom/bin/onvif_cgi_httpd"
     wsd="$SD/custom/bin/wsd_simple_server"
+    notify="$SD/custom/bin/onvif_notify_server"
     onvif_root="$SD/custom/onvif"
+    notify_dir="/tmp/onvif_notify_server"
 
     if [ ! -x "$httpd" ]; then
         log "missing ONVIF HTTP helper: $httpd"
@@ -170,6 +174,18 @@ start_onvif() {
     if [ ! -f "$onvif_root/onvif_simple_server.conf" ]; then
         log "missing ONVIF config: $onvif_root/onvif_simple_server.conf"
         return
+    fi
+
+    mkdir -p "$notify_dir" 2>> "$LOGDIR/onvif_notify_server.log" || true
+    rm -f "$notify_dir/motion_alarm" 2>> "$LOGDIR/onvif_notify_server.log" || true
+    if [ -x "$notify" ] && [ -d "$onvif_root/notify_files" ]; then
+        log "starting ONVIF notify server"
+        "$notify" -c "$onvif_root/onvif_simple_server.conf" \
+            -t "$onvif_root/notify_files" -p /tmp/onvif_notify_server.pid -f \
+            >> "$LOGDIR/onvif_notify_server.log" 2>&1 &
+        log "started ONVIF notify server pid=$!"
+    else
+        log "missing ONVIF notify helper or templates"
     fi
 
     log "starting ONVIF HTTP port=$ONVIF_PORT"
@@ -232,6 +248,9 @@ configure_tuya_motion() {
 
 start_stone_main() {
     if [ -x "$STONE_MAIN" ]; then
+        if [ -x "$PATCHER" ]; then
+            "$PATCHER" "$STONE_MAIN" >> "$LOG" 2>&1 || log "patch failed for $STONE_MAIN"
+        fi
         "$STONE_MAIN" >> "$LOGDIR/stone-main.log" 2>&1 &
         log "started Tuya stone main pid=$!"
     else
@@ -242,10 +261,11 @@ start_stone_main() {
 
 configure_tuya_motion
 start_telnetd
+start_stone_main
+sleep 2
 start_stream_relay
 start_onvif
 start_aic_forward
-start_stone_main
 
 wait
 """
@@ -295,12 +315,17 @@ name=Profile_0
 width=1920
 height=1080
 url=rtsp://%s:8554/main_ch
-snapurl=
+snapurl=http://%s:8899/snapshot.jpg
 type=H264
 audio_encoder=NONE
 audio_decoder=NONE
 ptz=0
-events=0
+events=3
+topic=tns1:VideoSource/MotionAlarm
+source_name=Source
+source_type=tt:ReferenceToken
+source_value=VideoSourceToken
+input_file=/tmp/onvif_notify_server/motion_alarm
 """
 
 
@@ -354,7 +379,7 @@ def copy_onvif_files(mount: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     bin_dir = root / "build" / "mipsel" / "bin"
     onvif_src = root / "build" / "third_party" / "onvif_simple_server"
-    bin_names = ("onvif_cgi_httpd", "onvif_simple_server", "wsd_simple_server")
+    bin_names = ("onvif_cgi_httpd", "onvif_simple_server", "onvif_notify_server", "wsd_simple_server")
     asset_dirs = (
         "device_service_files",
         "deviceio_service_files",
@@ -396,6 +421,16 @@ def copy_onvif_files(mount: Path) -> None:
         data = data.replace("MaxUserNameLength=\"0\"", "MaxUserNameLength=\"32\"")
         data = data.replace("MaxPasswordLength=\"0\"", "MaxPasswordLength=\"64\"")
         xml.write_text(data, encoding="ascii")
+
+    notify_xml = dst_root / "notify_files" / "Notify.xml"
+    data = notify_xml.read_text(encoding="ascii")
+    if 'xmlns:tns1="http://www.onvif.org/ver10/topics"' not in data:
+        data = data.replace(
+            'xmlns:tt="http://www.onvif.org/ver10/schema">',
+            'xmlns:tt="http://www.onvif.org/ver10/schema"\n'
+            '                   xmlns:tns1="http://www.onvif.org/ver10/topics">',
+        )
+        notify_xml.write_text(data, encoding="ascii")
 
 
 def write_mount(mount: Path, payload: bytes) -> None:
