@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+/build/
+/dist/
+/payload/
+
+*.bin
+*.img
+*.dump
+*.log
+*.h264
+*.pcap

@@ -1,0 +1,50 @@
+diff --git a/conf.c b/conf.c
+index c9a33a7..dd4b57d 100644
+--- a/conf.c
++++ b/conf.c
+@@ -23,8 +23,9 @@
+ #include <string.h>
+ #include <limits.h>
+ #include <errno.h>
+-
++#ifndef T23_NO_ONVIF_JSON
+ #include <json-c/json.h>
++#endif
+ #include "conf.h"
+ #include "utils.h"
+ #include "log.h"
+@@ -623,7 +624,7 @@ int process_conf_file(char *file)
+     }
+     return 0;
+ }
+-
++#ifndef T23_NO_ONVIF_JSON
+ // Remember to free the string
+ void get_string_from_json(char** var, json_object* j, char* name)
+ {
+@@ -1128,6 +1129,8 @@ int process_json_conf_file(char *file)
+     return 0;
+ }
+-
++#else
++int process_json_conf_file(char *file) { (void)file; return -1; }
++#endif
+ void free_conf_file()
+ {
+     int i;
+diff --git a/utils.c b/utils.c
+index dbef6e0..0082961 100644
+--- a/utils.c
++++ b/utils.c
+@@ -46,9 +46,9 @@
+ #include <tomcrypt.h>
+ #endif
+ #endif
+-
++#ifdef USE_ZLIB
+ #include <zlib.h>
+-
++#endif
+ #include "utils.h"
+ #include "onvif_simple_server.h"
+ #include "log.h"

