@@ -178,12 +178,33 @@ start_onvif() {
     log "started ONVIF HTTP pid=$!"
 
     if [ -x "$wsd" ] && [ -d "$onvif_root/wsd_files" ]; then
-        log "starting ONVIF WS-Discovery"
-        "$wsd" -i wlan0 -x "http://%s:$ONVIF_PORT/onvif/device_service" \
-            -m "LSC%20Outdoor%20Camera" -n "LSC" \
-            -p /tmp/wsd_simple_server.pid -t "$onvif_root/wsd_files" -f \
-            >> "$LOGDIR/wsd_simple_server.log" 2>&1 &
-        log "started ONVIF WS-Discovery pid=$!"
+        (
+            i=0
+            while [ "$i" -lt 45 ]; do
+                if ps | grep wsd_simple_server | grep -v grep >/dev/null 2>&1; then
+                    log "ONVIF WS-Discovery already running"
+                    exit 0
+                fi
+
+                log "starting ONVIF WS-Discovery attempt=$i"
+                "$wsd" -i wlan0 -x "http://%s:$ONVIF_PORT/onvif/device_service" \
+                    -m "LSC%20Outdoor%20Camera" -n "LSC" \
+                    -p /tmp/wsd_simple_server.pid -t "$onvif_root/wsd_files" -f \
+                    >> "$LOGDIR/wsd_simple_server.log" 2>&1 &
+                pid=$!
+                sleep 3
+                if kill -0 "$pid" 2>/dev/null; then
+                    log "started ONVIF WS-Discovery pid=$pid attempt=$i"
+                    exit 0
+                fi
+
+                log "ONVIF WS-Discovery exited attempt=$i"
+                i=$((i + 1))
+                sleep 2
+            done
+            log "ONVIF WS-Discovery failed after retries"
+        ) &
+        log "started ONVIF WS-Discovery retry pid=$!"
     else
         log "missing ONVIF WS-Discovery helper or templates"
     fi
