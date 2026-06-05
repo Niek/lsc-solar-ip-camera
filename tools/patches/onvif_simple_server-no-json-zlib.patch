@@ -32,6 +32,16 @@ index c9a33a7..dd4b57d 100644
  void free_conf_file()
  {
      int i;
+diff --git a/onvif_simple_server.c b/onvif_simple_server.c
+index df2945b..e7de449 100644
+--- a/onvif_simple_server.c
++++ b/onvif_simple_server.c
+@@ -41,4 +41,4 @@
+ #define DEFAULT_CONF_FILE "/etc/onvif_simple_server.conf"
+ #define DEFAULT_JSON_CONF_FILE "/etc/onvif_simple_server.json"
+-#define DEFAULT_LOG_FILE "/var/log/onvif_simple_server.log"
++#define DEFAULT_LOG_FILE "/tmp/mnt/sdcard/logs/onvif_simple_server.log"
+ #define DEBUG_FILE "/tmp/onvif_simple_server.debug"
 diff --git a/utils.c b/utils.c
 index dbef6e0..0082961 100644
 --- a/utils.c
@@ -48,3 +58,11 @@ index dbef6e0..0082961 100644
  #include "utils.h"
  #include "onvif_simple_server.h"
  #include "log.h"
+diff --git a/wsd_simple_server.c b/wsd_simple_server.c
+index 349045c..8fa43f5 100644
+--- a/wsd_simple_server.c
++++ b/wsd_simple_server.c
+@@ -41,2 +41,2 @@
+-#define DEFAULT_LOG_FILE "/var/log/wsd_simple_server.log"
++#define DEFAULT_LOG_FILE "/tmp/mnt/sdcard/logs/wsd_simple_server.log"
+ #define DEFAULT_TEMPLATE_DIR "/etc/wsd_simple_server"
