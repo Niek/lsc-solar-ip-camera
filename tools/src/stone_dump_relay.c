@@ -25,6 +25,7 @@
 #define TRUNCATE_AFTER (512 * 1024)
 #define MOTION_FILE "/tmp/onvif_notify_server/motion_alarm"
 #define MOTION_LOG "/tmp/mnt/sdcard/logs/video_motion.log"
+#define MOTION_LOCK_PATH "/tmp/stone_dump_relay.motion.lock"
 
 #define RTSP_SESSION "12345678"
 #define RTP_PAYLOAD_TYPE 96
@@ -259,6 +260,23 @@ static int lock_count_fd(int fd) {
     fl.l_type = F_WRLCK;
     fl.l_whence = SEEK_SET;
     return fcntl(fd, F_SETLKW, &fl);
+}
+
+static int try_lock_motion_fd(void) {
+    struct flock fl;
+    int fd = open(MOTION_LOCK_PATH, O_CREAT | O_RDWR, 0666);
+
+    if (fd < 0) {
+        return -1;
+    }
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if (fcntl(fd, F_SETLK, &fl) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 static int update_stream_count(int delta) {
@@ -731,7 +749,8 @@ static int process_nal_buffer(RtspSink *sink, MotionDetector *motion,
 
         if (nal_len > 0) {
             nal_type = buf[nal_start] & 0x1f;
-            if (nal_type == SMOLRTSP_H264_NAL_UNIT_CODED_SLICE_NON_IDR) {
+            if (motion != NULL &&
+                nal_type == SMOLRTSP_H264_NAL_UNIT_CODED_SLICE_NON_IDR) {
                 motion_detector_update(motion, nal_len);
             }
             if (send_h264_nal(sink, *timestamp, buf + nal_start, nal_len) < 0) {
@@ -819,8 +838,10 @@ static int stream_rtsp_h264(RtspSink *sink) {
     MotionDetector motion;
     size_t nal_len = 0;
     int dfd = -1;
+    int motion_lock_fd = -1;
     off_t offset = 0;
     uint32_t timestamp = (uint32_t)time(NULL) * RTP_CLOCK;
+    time_t next_motion_lock_try = 0;
 
     memset(&motion, 0, sizeof(motion));
     if (create_trigger() < 0) {
@@ -872,7 +893,15 @@ static int stream_rtsp_h264(RtspSink *sink) {
                 memcpy(nal_buf + nal_len, read_buf, (size_t)n);
                 nal_len += (size_t)n;
                 offset += n;
-                if (process_nal_buffer(sink, &motion, nal_buf, &nal_len, &timestamp) < 0) {
+                if (motion_lock_fd < 0) {
+                    time_t now = time(NULL);
+                    if (now >= next_motion_lock_try) {
+                        motion_lock_fd = try_lock_motion_fd();
+                        next_motion_lock_try = now + 1;
+                    }
+                }
+                if (process_nal_buffer(sink, motion_lock_fd >= 0 ? &motion : NULL,
+                                       nal_buf, &nal_len, &timestamp) < 0) {
                     break;
                 }
             }
@@ -891,8 +920,11 @@ static int stream_rtsp_h264(RtspSink *sink) {
     if (dfd >= 0) {
         close(dfd);
     }
-    if (motion.active) {
+    if (motion_lock_fd >= 0 && motion.active) {
         set_motion_file(0, 0, motion.ema_q8 >> 8);
+    }
+    if (motion_lock_fd >= 0) {
+        close(motion_lock_fd);
     }
     if (update_stream_count(-1) == 0) {
         unlink(DUMP_PATH);
