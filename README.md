@@ -146,6 +146,7 @@ The SD bootstrap currently:
 - sets these Tuya config values:
   - `tuya_hum_on_off=0`
   - `tuya_pir_on_off=1`
+  - `tuya_pir_sens=1`
   - `tuya_flip_onoff=0`
   - `tuya_watermark_onoff=0`
 

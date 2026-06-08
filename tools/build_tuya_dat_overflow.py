@@ -90,6 +90,7 @@ TELNET_PORT=2323
 ONVIF_PORT=8899
 TUYA_HUM_ON_OFF=0
 TUYA_PIR_ON_OFF=1
+TUYA_PIR_SENS=1
 TUYA_FLIP_ONOFF=0
 TUYA_WATERMARK_ONOFF=0
 AIC_FILTER_SECONDS=90
@@ -241,6 +242,7 @@ configure_tuya_motion() {
     mkdir -p /config/tuya 2>> "$LOG" || true
     set_tuya_config tuya_hum_on_off "$TUYA_HUM_ON_OFF"
     set_tuya_config tuya_pir_on_off "$TUYA_PIR_ON_OFF"
+    set_tuya_config tuya_pir_sens "$TUYA_PIR_SENS"
     set_tuya_config tuya_flip_onoff "$TUYA_FLIP_ONOFF"
     set_tuya_config tuya_watermark_onoff "$TUYA_WATERMARK_ONOFF"
     sync
