@@ -70,8 +70,8 @@ static void print_bytes(const uint8_t *buf, size_t len) {
     }
 }
 
-static int patch_site(int fd, const char *path, off_t offset, const char *label,
-                      const uint8_t *original, const uint8_t *patched,
+static int set_patch_site(int fd, const char *path, off_t offset, const char *label,
+                      const uint8_t *from, const uint8_t *target,
                       size_t len, int apply, int *changed) {
     uint8_t buf[sizeof(snapshot_callback_original)];
 
@@ -86,14 +86,14 @@ static int patch_site(int fd, const char *path, off_t offset, const char *label,
         return 1;
     }
 
-    if (memcmp(buf, patched, len) == 0) {
+    if (memcmp(buf, target, len) == 0) {
         if (!apply) {
-            printf("%s: %s already patched\n", path, label);
+            printf("%s: %s already in target state\n", path, label);
         }
         return 0;
     }
 
-    if (memcmp(buf, original, len) != 0) {
+    if (memcmp(buf, from, len) != 0) {
         if (apply) {
             fprintf(stderr, "%s: %s bytes changed after validation\n", path, label);
         } else {
@@ -109,42 +109,54 @@ static int patch_site(int fd, const char *path, off_t offset, const char *label,
         return 0;
     }
 
-    if (write_exact(fd, offset, patched, len) < 0) {
+    if (write_exact(fd, offset, target, len) < 0) {
         fprintf(stderr, "%s: %s patch write failed: %s\n", path, label, strerror(errno));
         return 1;
     }
-    *changed = 1;
-    printf("%s: patched %s\n", path, label);
+    if (changed != NULL) {
+        *changed = 1;
+    }
+    printf("%s: updated %s\n", path, label);
     return 0;
 }
 
-static int check_patch_sites(int fd, const char *path) {
-    if (patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
-                   low_power_branch, mips_nop, sizeof(low_power_branch), 0, NULL) != 0) {
+static int check_patch_sites(int fd, const char *path, int keep_low_power) {
+    if (keep_low_power) {
+        if (set_patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
+                           mips_nop, low_power_branch, sizeof(low_power_branch), 0, NULL) != 0) {
+            return 1;
+        }
+    } else if (set_patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
+                              low_power_branch, mips_nop, sizeof(low_power_branch), 0, NULL) != 0) {
         return 1;
     }
-    if (patch_site(fd, path, STONE_SNAPSHOT_CALLBACK_OFFSET,
-                   "ONVIF JPEG snapshot callback", snapshot_callback_original,
-                   snapshot_callback_patch, sizeof(snapshot_callback_original), 0, NULL) != 0) {
-        return 1;
-    }
-    return 0;
-}
-
-static int apply_patch_sites(int fd, const char *path, int *changed) {
-    if (patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
-                   low_power_branch, mips_nop, sizeof(low_power_branch), 1, changed) != 0) {
-        return 1;
-    }
-    if (patch_site(fd, path, STONE_SNAPSHOT_CALLBACK_OFFSET,
-                   "ONVIF JPEG snapshot callback", snapshot_callback_original,
-                   snapshot_callback_patch, sizeof(snapshot_callback_original), 1, changed) != 0) {
+    if (set_patch_site(fd, path, STONE_SNAPSHOT_CALLBACK_OFFSET,
+                       "ONVIF JPEG snapshot callback", snapshot_callback_original,
+                       snapshot_callback_patch, sizeof(snapshot_callback_original), 0, NULL) != 0) {
         return 1;
     }
     return 0;
 }
 
-static int validate_stone(int fd, const char *path) {
+static int apply_patch_sites(int fd, const char *path, int keep_low_power, int *changed) {
+    if (keep_low_power) {
+        if (set_patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
+                           mips_nop, low_power_branch, sizeof(low_power_branch), 1, changed) != 0) {
+            return 1;
+        }
+    } else if (set_patch_site(fd, path, STONE_LOW_POWER_BRANCH_OFFSET, "low-power branch",
+                              low_power_branch, mips_nop, sizeof(low_power_branch), 1, changed) != 0) {
+        return 1;
+    }
+    if (set_patch_site(fd, path, STONE_SNAPSHOT_CALLBACK_OFFSET,
+                       "ONVIF JPEG snapshot callback", snapshot_callback_original,
+                       snapshot_callback_patch, sizeof(snapshot_callback_original), 1, changed) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int validate_stone(int fd, const char *path, int keep_low_power) {
     struct stat st;
     uint8_t buf[4];
 
@@ -167,7 +179,7 @@ static int validate_stone(int fd, const char *path) {
         return 1;
     }
 
-    if (check_patch_sites(fd, path) != 0) {
+    if (check_patch_sites(fd, path, keep_low_power) != 0) {
         return 1;
     }
 
@@ -177,16 +189,27 @@ static int validate_stone(int fd, const char *path) {
 int main(int argc, char **argv) {
     const char *path;
     int check_only = 0;
+    int keep_low_power = 0;
     int changed = 0;
     int fd;
+    int i;
 
-    if (argc == 3 && strcmp(argv[1], "--check") == 0) {
-        check_only = 1;
-        path = argv[2];
-    } else if (argc == 2) {
-        path = argv[1];
-    } else {
-        fprintf(stderr, "usage: %s [--check] <stone-main>\n", argv[0]);
+    path = NULL;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--check") == 0) {
+            check_only = 1;
+        } else if (strcmp(argv[i], "--keep-low-power") == 0) {
+            keep_low_power = 1;
+        } else if (path == NULL) {
+            path = argv[i];
+        } else {
+            fprintf(stderr, "usage: %s [--check] [--keep-low-power] <stone-main>\n", argv[0]);
+            return 2;
+        }
+    }
+
+    if (path == NULL) {
+        fprintf(stderr, "usage: %s [--check] [--keep-low-power] <stone-main>\n", argv[0]);
         return 2;
     }
 
@@ -196,7 +219,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (validate_stone(fd, path) != 0) {
+    if (validate_stone(fd, path, keep_low_power) != 0) {
         close(fd);
         return 1;
     }
@@ -206,7 +229,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (apply_patch_sites(fd, path, &changed) != 0) {
+    if (apply_patch_sites(fd, path, keep_low_power, &changed) != 0) {
         close(fd);
         return 1;
     }

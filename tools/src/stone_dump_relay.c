@@ -108,6 +108,12 @@ static void set_motion_file(int active, size_t sample, uint32_t avg) {
     }
 }
 
+static int byte_motion_enabled(void) {
+    const char *value = getenv("STONE_MOTION_BYTES");
+
+    return value == NULL || strcmp(value, "0") != 0;
+}
+
 static void motion_detector_update(MotionDetector *det, size_t sample) {
     uint32_t avg;
     size_t threshold;
@@ -839,6 +845,7 @@ static int stream_rtsp_h264(RtspSink *sink) {
     size_t nal_len = 0;
     int dfd = -1;
     int motion_lock_fd = -1;
+    int detect_motion = byte_motion_enabled();
     off_t offset = 0;
     uint32_t timestamp = (uint32_t)time(NULL) * RTP_CLOCK;
     time_t next_motion_lock_try = 0;
@@ -893,14 +900,14 @@ static int stream_rtsp_h264(RtspSink *sink) {
                 memcpy(nal_buf + nal_len, read_buf, (size_t)n);
                 nal_len += (size_t)n;
                 offset += n;
-                if (motion_lock_fd < 0) {
+                if (detect_motion && motion_lock_fd < 0) {
                     time_t now = time(NULL);
                     if (now >= next_motion_lock_try) {
                         motion_lock_fd = try_lock_motion_fd();
                         next_motion_lock_try = now + 1;
                     }
                 }
-                if (process_nal_buffer(sink, motion_lock_fd >= 0 ? &motion : NULL,
+                if (process_nal_buffer(sink, detect_motion && motion_lock_fd >= 0 ? &motion : NULL,
                                        nal_buf, &nal_len, &timestamp) < 0) {
                     break;
                 }
@@ -920,7 +927,7 @@ static int stream_rtsp_h264(RtspSink *sink) {
     if (dfd >= 0) {
         close(dfd);
     }
-    if (motion_lock_fd >= 0 && motion.active) {
+    if (detect_motion && motion_lock_fd >= 0 && motion.active) {
         set_motion_file(0, 0, motion.ema_q8 >> 8);
     }
     if (motion_lock_fd >= 0) {

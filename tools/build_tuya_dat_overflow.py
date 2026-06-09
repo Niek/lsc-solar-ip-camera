@@ -19,6 +19,7 @@ LOG="$LOGDIR/firstboot.log"
 PATCHER="$SD/custom/bin/patch_stone_main"
 DST="$SD/factory/stone-main.bin"
 TMP="$DST.tmp"
+STONE_LOW_POWER=__STONE_LOW_POWER__
 
 mkdir -p "$LOGDIR" "$SD/factory" >/dev/null 2>&1 || true
 : > "$LOG" 2>/dev/null || LOG=/dev/null
@@ -36,7 +37,7 @@ fail() {
 find_stone_exe() {
     for exe in /proc/[0-9]*/exe; do
         [ -r "$exe" ] || continue
-        "$PATCHER" --check "$exe" >/dev/null 2>&1 && {
+        patch_stone --check "$exe" >/dev/null 2>&1 && {
             echo "$exe"
             return 0
         }
@@ -44,20 +45,29 @@ find_stone_exe() {
     return 1
 }
 
+patch_stone() {
+    if [ "$STONE_LOW_POWER" = "1" ]; then
+        "$PATCHER" --keep-low-power "$@"
+    else
+        "$PATCHER" "$@"
+    fi
+}
+
 echo firstboot-start > /dev/console
 log "start"
 
 [ -x "$PATCHER" ] || fail "missing patcher: $PATCHER"
+log "stone low power=$STONE_LOW_POWER"
 
-if [ -x "$DST" ] && "$PATCHER" --check "$DST" >> "$LOG" 2>&1; then
-    "$PATCHER" "$DST" >> "$LOG" 2>&1 || fail "patch failed for existing $DST"
+if [ -x "$DST" ] && patch_stone --check "$DST" >> "$LOG" 2>&1; then
+    patch_stone "$DST" >> "$LOG" 2>&1 || fail "patch failed for existing $DST"
     log "existing $DST is usable"
 else
     src="$(find_stone_exe)" || fail "could not find running Tuya executable via /proc"
     log "copying Tuya executable from $src"
     rm -f "$TMP"
     cp "$src" "$TMP" 2>> "$LOG" || fail "copy failed from $src"
-    "$PATCHER" "$TMP" >> "$LOG" 2>&1 || fail "patch failed"
+    patch_stone "$TMP" >> "$LOG" 2>&1 || fail "patch failed"
     chmod 755 "$TMP" 2>> "$LOG" || true
     mv -f "$TMP" "$DST" 2>> "$LOG" || fail "move failed"
     sync
@@ -77,6 +87,7 @@ SD=/tmp/mnt/sdcard
 LOGDIR="$SD/logs"
 LOG="$LOGDIR/t23-entrypoint.log"
 PATCHER="$SD/custom/bin/patch_stone_main"
+STONE_LOW_POWER=__STONE_LOW_POWER__
 
 mkdir -p "$LOGDIR" >/dev/null 2>&1 || true
 : > "$LOG" 2>/dev/null || LOG=/dev/null
@@ -91,13 +102,16 @@ ONVIF_PORT=8899
 TUYA_HUM_ON_OFF=0
 TUYA_PIR_ON_OFF=1
 TUYA_PIR_SENS=1
+TUYA_RECORD_TIME=2
 TUYA_FLIP_ONOFF=0
 TUYA_WATERMARK_ONOFF=0
 AIC_FILTER_SECONDS=90
+LOW_POWER_MOTION_HOLD_SECONDS=30
 
 echo t23-entrypoint-start > /dev/console
 log "start"
-for run_log in stone-main.log telnetd.log aic_filter.log stream_relay.log onvif_httpd.log wsd_simple_server.log onvif_simple_server.log onvif_notify_server.log video_motion.log; do
+log "stone low power=$STONE_LOW_POWER"
+for run_log in stone-main.log telnetd.log aic_filter.log stream_relay.log onvif_httpd.log wsd_simple_server.log onvif_simple_server.log onvif_notify_server.log video_motion.log pir_motion.log; do
     : > "$LOGDIR/$run_log" 2>/dev/null || true
 done
 log "reset per-run logs"
@@ -151,9 +165,15 @@ start_stream_relay() {
         return
     fi
 
-    log "starting stream relay"
+    if [ "$STONE_LOW_POWER" = "1" ]; then
+        motion_bytes=0
+    else
+        motion_bytes=1
+    fi
+
+    log "starting stream relay byte_motion=$motion_bytes"
     echo stream-relay-start > /dev/console
-    "$helper" >> "$LOGDIR/stream_relay.log" 2>&1 &
+    STONE_MOTION_BYTES="$motion_bytes" "$helper" >> "$LOGDIR/stream_relay.log" 2>&1 &
     log "started stream relay pid=$!"
 }
 
@@ -243,15 +263,77 @@ configure_tuya_motion() {
     set_tuya_config tuya_hum_on_off "$TUYA_HUM_ON_OFF"
     set_tuya_config tuya_pir_on_off "$TUYA_PIR_ON_OFF"
     set_tuya_config tuya_pir_sens "$TUYA_PIR_SENS"
+    set_tuya_config tuya_record_time "$TUYA_RECORD_TIME"
     set_tuya_config tuya_flip_onoff "$TUYA_FLIP_ONOFF"
     set_tuya_config tuya_watermark_onoff "$TUYA_WATERMARK_ONOFF"
     sync
 }
 
+start_pir_motion_watcher() {
+    if [ "$STONE_LOW_POWER" != "1" ]; then
+        log "PIR log motion watcher disabled"
+        return
+    fi
+
+    (
+        notify_dir="/tmp/onvif_notify_server"
+        motion_file="$notify_dir/motion_alarm"
+        src="$LOGDIR/stone-main.log"
+        out="$LOGDIR/pir_motion.log"
+        seen=0
+        active=0
+        until_ts=0
+
+        mkdir -p "$notify_dir" >/dev/null 2>&1 || true
+        echo "[$(date +%Y-%m-%dT%H:%M:%S)] watcher start hold=$LOW_POWER_MOTION_HOLD_SECONDS" >> "$out"
+        while true; do
+            now="$(date +%s 2>/dev/null || echo 0)"
+            if [ "$active" = "1" ] && [ "$now" -ge "$until_ts" ]; then
+                rm -f "$motion_file" 2>/dev/null || true
+                active=0
+                echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-off" >> "$out"
+            fi
+
+            if [ -f "$src" ]; then
+                n=0
+                while IFS= read -r line; do
+                    n=$((n + 1))
+                    [ "$n" -le "$seen" ] && continue
+                    case "$line" in
+                        *"event=4098"*)
+                            mkdir -p "$notify_dir" >/dev/null 2>&1 || true
+                            : > "$motion_file" 2>/dev/null || true
+                            now="$(date +%s 2>/dev/null || echo 0)"
+                            until_ts=$((now + LOW_POWER_MOTION_HOLD_SECONDS))
+                            if [ "$active" = "1" ]; then
+                                echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-extend $line" >> "$out"
+                            else
+                                echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-on $line" >> "$out"
+                            fi
+                            active=1
+                            ;;
+                    esac
+                done < "$src"
+                if [ "$n" -lt "$seen" ]; then
+                    seen=0
+                else
+                    seen="$n"
+                fi
+            fi
+            sleep 1
+        done
+    ) &
+    log "started PIR log motion watcher pid=$!"
+}
+
 start_stone_main() {
     if [ -x "$STONE_MAIN" ]; then
         if [ -x "$PATCHER" ]; then
-            "$PATCHER" "$STONE_MAIN" >> "$LOG" 2>&1 || log "patch failed for $STONE_MAIN"
+            if [ "$STONE_LOW_POWER" = "1" ]; then
+                "$PATCHER" --keep-low-power "$STONE_MAIN" >> "$LOG" 2>&1 || log "patch failed for $STONE_MAIN"
+            else
+                "$PATCHER" "$STONE_MAIN" >> "$LOG" 2>&1 || log "patch failed for $STONE_MAIN"
+            fi
         fi
         "$STONE_MAIN" >> "$LOGDIR/stone-main.log" 2>&1 &
         log "started Tuya stone main pid=$!"
@@ -267,6 +349,7 @@ start_stone_main
 sleep 2
 start_stream_relay
 start_onvif
+start_pir_motion_watcher
 start_aic_forward
 
 wait
@@ -435,7 +518,11 @@ def copy_onvif_files(mount: Path) -> None:
         notify_xml.write_text(data, encoding="ascii")
 
 
-def write_mount(mount: Path, payload: bytes) -> None:
+def script_with_options(script: str, *, stone_low_power: bool) -> str:
+    return script.replace("__STONE_LOW_POWER__", "1" if stone_low_power else "0")
+
+
+def write_mount(mount: Path, payload: bytes, *, stone_low_power: bool) -> None:
     if not mount.is_dir():
         raise SystemExit(f"mountpoint is not a directory: {mount}")
 
@@ -450,11 +537,11 @@ def write_mount(mount: Path, payload: bytes) -> None:
     chmod_exec(factory_main)
 
     firstboot = mount / "factory" / "firstboot.sh"
-    firstboot.write_text(FIRSTBOOT, encoding="ascii")
+    firstboot.write_text(script_with_options(FIRSTBOOT, stone_low_power=stone_low_power), encoding="ascii")
     chmod_exec(firstboot)
 
     entrypoint = mount / "custom" / "scripts" / "entrypoint_t23.sh"
-    entrypoint.write_text(T23_ENTRYPOINT, encoding="ascii")
+    entrypoint.write_text(script_with_options(T23_ENTRYPOINT, stone_low_power=stone_low_power), encoding="ascii")
     chmod_exec(entrypoint)
 
     copy_aic_filter(mount)
@@ -467,6 +554,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Write the minimal T23/AIC SD bootstrap files and tuya.dat overflow kicker."
     )
+    parser.set_defaults(stone_low_power=True)
+    power = parser.add_mutually_exclusive_group()
+    power.add_argument("--stone-low-power", dest="stone_low_power", action="store_true",
+                       help="keep stone-main's stock low-power branch enabled (default)")
+    power.add_argument("--no-low-power", dest="stone_low_power", action="store_false",
+                       help="patch stone-main to keep Linux awake and use RTSP byte-motion fallback")
     parser.add_argument("mountpoint", nargs="?", help="SD card mountpoint to write")
     args = parser.parse_args()
 
@@ -476,12 +569,13 @@ def main() -> int:
         parser.error("provide a mountpoint")
 
     mount = Path(args.mountpoint)
-    write_mount(mount, payload)
+    write_mount(mount, payload, stone_low_power=args.stone_low_power)
 
     print(f"wrote {mount / 'tuya.dat'} ({len(payload)} bytes)")
     print(f"wrote {mount / 'factory' / 'main'}")
     print(f"wrote {mount / 'factory' / 'firstboot.sh'}")
     print(f"wrote {mount / 'custom' / 'scripts' / 'entrypoint_t23.sh'}")
+    print(f"stone low power: {'enabled' if args.stone_low_power else 'disabled'}")
     print("telnet: telnet <camera-ip> 2323")
     print("RTSP main stream: rtsp://<camera-ip>:8554/main_ch")
     print("ONVIF device service: http://<camera-ip>:8899/onvif/device_service")

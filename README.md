@@ -31,9 +31,9 @@ The working route came from dumping the SPI flash with a CH341A programmer,
 unpacking/decrypting the firmware, and finding the SD-card `tuya.dat` import
 path. This repository uses that path as a one-time bootstrap: on first boot the
 camera executes `firstboot.sh` from the SD card, copies the currently running
-Tuya executable from `/proc`, patches the SD-card copy to avoid the low-power
-shutdown path that otherwise kills the Linux side, then reboots into the
-SD-card factory bootstrap. The original Tuya app still runs from there.
+Tuya executable from `/proc`, patches the SD-card copy for the local ONVIF
+hooks, then reboots into the SD-card factory bootstrap. The original Tuya app
+still runs from there.
 
 ## Safety
 
@@ -72,7 +72,8 @@ This builds:
 - `aic_filter`: opens TCP forwarding through the AIC Wi-Fi side.
 - `stone_dump_relay`: turns the Tuya H264 dump stream into RTSP/raw H264.
 - `onvif_cgi_httpd`: small HTTP wrapper for ONVIF SOAP requests.
-- `patch_stone_main`: patches the copied Tuya binary to keep Linux awake.
+- `patch_stone_main`: patches the copied Tuya binary for ONVIF snapshots and
+  can optionally disable the stock low-power branch.
 - `onvif_simple_server`: handles ONVIF device/media SOAP calls.
 - `onvif_notify_server`: tracks ONVIF event state for PullPoint subscriptions.
 - `wsd_simple_server`: announces the camera via ONVIF WS-Discovery.
@@ -116,6 +117,13 @@ mkdir -p /tmp/lsc-solar-payload
 ./tools/build_tuya_dat_overflow.py /tmp/lsc-solar-payload
 ```
 
+Low-power/PIR wake mode is the default. To build a high-power test payload that
+keeps the Linux side awake and uses the RTSP byte-motion fallback:
+
+```sh
+./tools/build_tuya_dat_overflow.py --no-low-power /tmp/lsc-solar-payload
+```
+
 Push it to the camera:
 
 ```sh
@@ -133,20 +141,24 @@ The SD bootstrap currently:
 
 - on first boot, copies the running Tuya executable from `/proc` to
   `factory/stone-main.bin`
-- patches that SD-card copy to keep the Linux side awake
+- patches that SD-card copy for ONVIF snapshots and, if
+  `--no-low-power` was used, to keep the Linux side awake
 - sets `/config/fmode` only after the copy and patch succeed
 - consumes the `tuya.dat` trigger after first use
 - keeps `/config/fmode` asserted
 - starts telnet on port `2323`
 - starts the RTSP relay on port `8554`
 - starts ONVIF HTTP, WS-Discovery, and motion-event notification
-- feeds ONVIF motion from the RTSP relay's encoded-frame motion fallback
+- in low-power mode, feeds ONVIF motion from stock `stone-main.log` PIR events
+- in high-power mode, feeds ONVIF motion from the RTSP relay's encoded-frame
+  motion fallback
 - applies AIC TCP forwarding filters
 - starts the original Tuya process from `factory/stone-main.bin`
 - sets these Tuya config values:
   - `tuya_hum_on_off=0`
   - `tuya_pir_on_off=1`
   - `tuya_pir_sens=1`
+  - `tuya_record_time=2` (max stock PIR record time, about 31 seconds)
   - `tuya_flip_onoff=0`
   - `tuya_watermark_onoff=0`
 
