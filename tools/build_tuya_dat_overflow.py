@@ -281,16 +281,15 @@ start_pir_motion_watcher() {
         src="$LOGDIR/stone-main.log"
         out="$LOGDIR/pir_motion.log"
         seen=0
-        active=0
-        until_ts=0
+        motion_until=0
 
         mkdir -p "$notify_dir" >/dev/null 2>&1 || true
         echo "[$(date +%Y-%m-%dT%H:%M:%S)] watcher start hold=$LOW_POWER_MOTION_HOLD_SECONDS" >> "$out"
         while true; do
             now="$(date +%s 2>/dev/null || echo 0)"
-            if [ "$active" = "1" ] && [ "$now" -ge "$until_ts" ]; then
+            if [ "$motion_until" -gt 0 ] && [ "$now" -ge "$motion_until" ]; then
                 rm -f "$motion_file" 2>/dev/null || true
-                active=0
+                motion_until=0
                 echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-off" >> "$out"
             fi
 
@@ -300,19 +299,24 @@ start_pir_motion_watcher() {
                     n=$((n + 1))
                     [ "$n" -le "$seen" ] && continue
                     case "$line" in
-                        *"event=4098"*)
-                            mkdir -p "$notify_dir" >/dev/null 2>&1 || true
-                            : > "$motion_file" 2>/dev/null || true
-                            now="$(date +%s 2>/dev/null || echo 0)"
-                            until_ts=$((now + LOW_POWER_MOTION_HOLD_SECONDS))
-                            if [ "$active" = "1" ]; then
-                                echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-extend $line" >> "$out"
-                            else
-                                echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-on $line" >> "$out"
-                            fi
-                            active=1
+                        *">pir evt<"*|*"pir:1("*)
+                            ;;
+                        *"event="*)
+                            event="${line#*event=}"
+                            event="${event%%[!0-9]*}"
+                            [ -n "$event" ] && [ "$((event & 2))" -ne 0 ] || continue
+                            ;;
+                        *)
+                            continue
                             ;;
                     esac
+
+                    now="$(date +%s 2>/dev/null || echo 0)"
+                    if [ "$motion_until" -le "$now" ] || [ ! -f "$motion_file" ]; then
+                        : > "$motion_file" 2>/dev/null || true
+                        echo "[$(date +%Y-%m-%dT%H:%M:%S)] motion-on $line" >> "$out"
+                    fi
+                    motion_until=$((now + LOW_POWER_MOTION_HOLD_SECONDS))
                 done < "$src"
                 if [ "$n" -lt "$seen" ]; then
                     seen=0
