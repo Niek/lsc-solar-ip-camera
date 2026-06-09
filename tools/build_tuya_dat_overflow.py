@@ -59,20 +59,15 @@ log "start"
 [ -x "$PATCHER" ] || fail "missing patcher: $PATCHER"
 log "stone low power=$STONE_LOW_POWER"
 
-if [ -x "$DST" ] && patch_stone --check "$DST" >> "$LOG" 2>&1; then
-    patch_stone "$DST" >> "$LOG" 2>&1 || fail "patch failed for existing $DST"
-    log "existing $DST is usable"
-else
-    src="$(find_stone_exe)" || fail "could not find running Tuya executable via /proc"
-    log "copying Tuya executable from $src"
-    rm -f "$TMP"
-    cp "$src" "$TMP" 2>> "$LOG" || fail "copy failed from $src"
-    patch_stone "$TMP" >> "$LOG" 2>&1 || fail "patch failed"
-    chmod 755 "$TMP" 2>> "$LOG" || true
-    mv -f "$TMP" "$DST" 2>> "$LOG" || fail "move failed"
-    sync
-    log "wrote patched $DST"
-fi
+src="$(find_stone_exe)" || fail "could not find running Tuya executable via /proc"
+log "copying Tuya executable from $src"
+rm -f "$TMP"
+cp "$src" "$TMP" 2>> "$LOG" || fail "copy failed from $src"
+patch_stone "$TMP" >> "$LOG" 2>&1 || fail "patch failed"
+chmod 755 "$TMP" 2>> "$LOG" || true
+mv -f "$TMP" "$DST" 2>> "$LOG" || fail "move failed"
+sync
+log "wrote patched $DST"
 
 touch /config/fmode 2>> "$LOG" || fail "could not set /config/fmode"
 sync
