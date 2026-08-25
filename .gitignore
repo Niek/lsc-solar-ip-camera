@@ -6,6 +6,11 @@ __pycache__/
 /dist/
 /payload/
 
+# Local operator and reverse-engineering helpers.
+/AGENTS.md
+/tools/fetch_tuya_ota.sh
+/tools/wakeup.py
+
 *.bin
 *.img
 *.dump

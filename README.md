@@ -18,8 +18,11 @@ for the
 
 ## Status
 
-Tested on firmware `6.2712.35` with an Ingenic T23 based camera. Other LSC/Tuya
-solar cameras may use different firmware layouts, offsets, or boot behavior.
+Live-tested on an Ingenic T23 based camera before and after an OTA from
+`6.2712.35` to `6.2712.43`. The SD bootstrap captured the newly flashed
+executable, discovered its changed patch locations, and brought telnet, RTSP,
+ONVIF, and the Tuya live view back after reboot. Other LSC/Tuya solar cameras
+may still use different firmware layouts or boot behavior.
 
 ## Background
 
@@ -55,6 +58,44 @@ sync
 reboot
 ```
 
+Toolkit runtime logs are reset at boot and truncated in place if an individual
+log grows beyond 256 KiB. Stock recordings under `DCIM/` are not deleted by the
+toolkit and can still fill or corrupt a small SD card; use the app's recording
+retention/format controls and keep reasonable free-space headroom.
+
+On a low-power PIR wake, the ONVIF motion state is re-pulsed every 10 seconds
+for the active motion window. This gives an NVR time to recreate its PullPoint
+subscription after the camera boots instead of missing the initial transition.
+
+## Firmware upgrades
+
+The SD bootstrap no longer pins the first firmware's Tuya executable forever.
+The stock boot script starts the SD factory hook in the background and then
+unlinks `/stone/main`, so the hook first creates an immediate hard link to that
+boot's executable. The entrypoint hashes this preserved file and, when it
+changed, patches a fresh SD copy using unique instruction-context signatures
+and records the source hash. This has been live-validated across the
+`6.2712.35` to `6.2712.43` OTA. That package does not contain a config-partition
+image, and the live upgrade confirmed that `/config/fmode` remains effective.
+
+After running `./tools/compile.sh` and extracting another OTA, run the complete
+compatibility check before using it on a camera:
+
+```sh
+./tools/check_stone_compat.sh /path/to/extracted/rootfs/stone/main
+```
+
+This works on temporary copies: it tests low- and high-power patching,
+bootstrap-gadget discovery, fail-closed signature handling, and generation of a
+complete payload.
+
+If a future executable no longer matches those structural signatures, the
+patcher refuses to write at a guessed location. The boot script then runs the
+new stock executable unmodified. The Tuya app and local services are still
+launched, but RTSP data and patched ONVIF snapshots may depend on behavior that
+changed in that firmware. This is deliberately a fail-safe compatibility
+policy, not a guarantee that every future firmware can be patched automatically.
+
 ## Prerequisites
 
 - macOS or Linux host
@@ -72,8 +113,9 @@ This builds:
 - `aic_filter`: opens TCP forwarding through the AIC Wi-Fi side.
 - `stone_dump_relay`: turns the Tuya H264 dump stream into RTSP/raw H264.
 - `onvif_cgi_httpd`: small HTTP wrapper for ONVIF SOAP requests.
-- `patch_stone_main`: patches the copied Tuya binary for ONVIF snapshots and
-  can optionally disable the stock low-power branch.
+- `patch_stone_main`: discovers and patches the relevant Tuya code by
+  instruction context for ONVIF snapshots and can optionally disable the stock
+  low-power branch.
 - `onvif_simple_server`: handles ONVIF device/media SOAP calls.
 - `onvif_notify_server`: tracks ONVIF event state for PullPoint subscriptions.
 - `wsd_simple_server`: announces the camera via ONVIF WS-Discovery.
@@ -87,9 +129,26 @@ The build script fetches pinned upstream sources for
 Replace `/path/to/sd-card` with your mounted SD-card path.
 
 ```sh
-./tools/build_tuya_dat_overflow.py /path/to/sd-card
+./tools/build_tuya_dat_overflow.py \
+  --assume-6.2712.35 \
+  /path/to/sd-card
 sync
 ```
+
+The builder never silently assumes a firmware version. The example above makes
+the known `6.2712.35` address explicit. For a fresh install on another
+firmware, provide its extracted stock `stone/main`; the builder validates the
+overflow layout and discovers the matching bootstrap gadget:
+
+```sh
+./tools/build_tuya_dat_overflow.py \
+  --stone-main /path/to/extracted/rootfs/stone/main \
+  /path/to/sd-card
+sync
+```
+
+The stock executable is only inspected on the host and is not copied into the
+repository or the generated payload.
 
 Insert the SD card and boot the camera. On success, the camera should expose:
 
@@ -114,14 +173,16 @@ Generate a fresh payload directory:
 ```sh
 rm -rf /tmp/lsc-solar-payload
 mkdir -p /tmp/lsc-solar-payload
-./tools/build_tuya_dat_overflow.py /tmp/lsc-solar-payload
+./tools/build_tuya_dat_overflow.py --no-trigger /tmp/lsc-solar-payload
 ```
 
 Low-power/PIR wake mode is the default. To build a high-power test payload that
 keeps the Linux side awake and uses the RTSP byte-motion fallback:
 
 ```sh
-./tools/build_tuya_dat_overflow.py --no-low-power /tmp/lsc-solar-payload
+./tools/build_tuya_dat_overflow.py \
+  --no-trigger --no-low-power \
+  /tmp/lsc-solar-payload
 ```
 
 Push it to the camera:
@@ -141,7 +202,9 @@ The SD bootstrap currently:
 
 - on first boot, copies the running Tuya executable from `/proc` to
   `factory/stone-main.bin`
-- patches that SD-card copy for ONVIF snapshots and, if
+- on later boots, refreshes that copy when the internal firmware executable
+  changes
+- discovers and patches the SD-card copy for ONVIF snapshots and, if
   `--no-low-power` was used, to keep the Linux side awake
 - sets `/config/fmode` only after the copy and patch succeed
 - consumes the `tuya.dat` trigger after first use
@@ -153,7 +216,8 @@ The SD bootstrap currently:
 - in high-power mode, feeds ONVIF motion from the RTSP relay's encoded-frame
   motion fallback
 - applies AIC TCP forwarding filters
-- starts the original Tuya process from `factory/stone-main.bin`
+- starts the current Tuya process from the patched SD-card copy, or falls back
+  to the unmodified internal copy when a future layout is not recognized
 - sets these Tuya config values:
   - `tuya_hum_on_off=0`
   - `tuya_pir_on_off=1`
@@ -166,6 +230,7 @@ The SD bootstrap currently:
 
 ```text
 tools/build_tuya_dat_overflow.py      SD payload builder
+tools/check_stone_compat.sh           offline firmware compatibility check
 tools/push_camera_live.py             live network updater
 tools/compile.sh                      Docker based MIPS build
 tools/src/                            small camera-side helpers
