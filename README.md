@@ -130,25 +130,24 @@ Replace `/path/to/sd-card` with your mounted SD-card path.
 
 ```sh
 ./tools/build_tuya_dat_overflow.py \
-  --assume-6.2712.35 \
-  /path/to/sd-card
-sync
-```
-
-The builder never silently assumes a firmware version. The example above makes
-the known `6.2712.35` address explicit. For a fresh install on another
-firmware, provide its extracted stock `stone/main`; the builder validates the
-overflow layout and discovers the matching bootstrap gadget:
-
-```sh
-./tools/build_tuya_dat_overflow.py \
   --stone-main /path/to/extracted/rootfs/stone/main \
   /path/to/sd-card
 sync
 ```
 
-The stock executable is only inspected on the host and is not copied into the
-repository or the generated payload.
+Generating a trigger always requires the exact stock `stone/main` from the
+firmware currently installed on the target camera. The builder validates the
+overflow layout and discovers the matching bootstrap gadget; it has no raw
+address or assumed-version escape hatch. The stock executable is only inspected
+on the host and is not copied into the repository or generated payload.
+
+Legacy cards may contain `tuya.dat.used`, a consumed firmware-specific trigger.
+Never rename or copy it back to `tuya.dat`, especially after an OTA. Current
+payloads delete the trigger as soon as firstboot starts, and the builder removes
+legacy `.used` files. A cached `update.bin` identifies an available or downloaded
+package, not necessarily the firmware currently installed. If factory mode must
+be re-established, determine the installed version and regenerate `tuya.dat`
+from that version's exact `stone/main` using the command above.
 
 Insert the SD card and boot the camera. On success, the camera should expose:
 
@@ -207,7 +206,7 @@ The SD bootstrap currently:
 - discovers and patches the SD-card copy for ONVIF snapshots and, if
   `--no-low-power` was used, to keep the Linux side awake
 - sets `/config/fmode` only after the copy and patch succeed
-- consumes the `tuya.dat` trigger after first use
+- deletes the `tuya.dat` trigger as soon as firstboot starts
 - keeps `/config/fmode` asserted
 - starts telnet on port `2323`
 - starts the RTSP relay on port `8554`

