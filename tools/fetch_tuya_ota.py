@@ -10,6 +10,7 @@ import base64
 import getpass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -100,7 +101,7 @@ async def fallback(client, device_id, current, journal):
 
 
 async def run(args):
-    password = getpass.getpass("Smart Life password: ")
+    password = os.environ.get("TUYA_PASSWORD") or getpass.getpass("Smart Life password: ")
     journal = args.output / "restore.json"
     async with aiohttp.ClientSession() as session:
         client = TuyaPasswordClient.for_application(
@@ -158,8 +159,11 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--email", required=True, help="Smart Life account email")
-    parser.add_argument("--country", required=True, help="account country calling code, e.g. 31")
+    parser.add_argument("--email", default=os.environ.get("TUYA_EMAIL"),
+                        required=not os.environ.get("TUYA_EMAIL"), help="Smart Life account email")
+    parser.add_argument("--country", default=os.environ.get("TUYA_COUNTRY"),
+                        required=not os.environ.get("TUYA_COUNTRY"),
+                        help="account country calling code, e.g. 31")
     parser.add_argument("--device", help="device ID (otherwise choose from the account's device list)")
     parser.add_argument("--output", type=Path, default=Path("build/ota"))
     args = parser.parse_args()

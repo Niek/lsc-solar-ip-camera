@@ -16,32 +16,30 @@ This work started from
 for the
 [LSC Smart Connect solar IP camera](https://www.action.com/nl-nl/p/3222494/lsc-smart-connect-solar-ip-camera/).
 
-## Status
+## Compatibility
 
-Live-tested on an Ingenic T23 based camera before and after an OTA from
-`6.2712.35` to `6.2712.43`. The SD bootstrap captured the newly flashed
-executable, discovered its changed patch locations, and brought telnet, RTSP,
-ONVIF, and the Tuya live view back after reboot. Other LSC/Tuya solar cameras
-may still use different firmware layouts or boot behavior.
+Supports the Ingenic T23 based camera with firmware `6.2712.35` and
+`6.2712.43`. Other LSC/Tuya cameras may use different firmware layouts or
+boot behavior.
 
 ## Background
 
-The first route was UART with an FT232RL USB-TTL adapter. That exposed useful
-boot logs and a Linux login prompt, but the console is password protected. The
-root password hash is traditional DES `crypt(3)` and was not cracked.
+The investigation started with UART through an FT232RL USB-TTL adapter. It
+exposed boot logs and a Linux login prompt, but the console was password
+protected; the root password's DES `crypt(3)` hash was not cracked.
 
-The working route came from dumping the SPI flash with a CH341A programmer,
-unpacking/decrypting the firmware, and finding the SD-card `tuya.dat` import
-path. This repository uses that path as a one-time bootstrap: on first boot the
-camera executes `firstboot.sh` from the SD card, copies the currently running
-Tuya executable from `/proc`, patches the SD-card copy for the local ONVIF
-hooks, then reboots into the SD-card factory bootstrap. The original Tuya app
-still runs from there.
+Dumping the SPI flash with a CH341A programmer, then unpacking and decrypting
+the firmware, revealed the SD-card `tuya.dat` import path used by this toolkit.
+OTA firmware can now be downloaded and decompiled directly.
+
+## How it works
+
+The SD-card `tuya.dat` import launches `firstboot.sh` once. It copies the
+running Tuya executable from `/proc`, patches the SD-card copy for local
+ONVIF hooks, and reboots into the SD-card factory bootstrap. The Tuya app
+continues running alongside the local services.
 
 ## Safety
-
-This modifies the camera boot flow from an SD card. Test at your own risk and
-expect firmware differences across product batches.
 
 This repository intentionally does not include firmware dumps, keys, logs, or
 proprietary Tuya binaries.
@@ -69,14 +67,8 @@ subscription after the camera boots instead of missing the initial transition.
 
 ## Firmware upgrades
 
-The SD bootstrap no longer pins the first firmware's Tuya executable forever.
-The stock boot script starts the SD factory hook in the background and then
-unlinks `/stone/main`, so the hook first creates an immediate hard link to that
-boot's executable. The entrypoint hashes this preserved file and, when it
-changed, patches a fresh SD copy using unique instruction-context signatures
-and records the source hash. This has been live-validated across the
-`6.2712.35` to `6.2712.43` OTA. That package does not contain a config-partition
-image, and the live upgrade confirmed that `/config/fmode` remains effective.
+The SD bootstrap preserves the current Tuya executable on each boot and
+refreshes its patched SD-card copy when the firmware changes.
 
 After running `./tools/compile.sh` and extracting another OTA, run the complete
 compatibility check before using it on a camera:
@@ -85,16 +77,10 @@ compatibility check before using it on a camera:
 ./tools/check_stone_compat.sh /path/to/extracted/rootfs/stone/main
 ```
 
-This works on temporary copies: it tests low- and high-power patching,
-bootstrap-gadget discovery, fail-closed signature handling, and generation of a
-complete payload.
-
-If a future executable no longer matches those structural signatures, the
-patcher refuses to write at a guessed location. The boot script then runs the
-new stock executable unmodified. The Tuya app and local services are still
-launched, but RTSP data and patched ONVIF snapshots may depend on behavior that
-changed in that firmware. This is deliberately a fail-safe compatibility
-policy, not a guarantee that every future firmware can be patched automatically.
+The check uses temporary copies to validate patching, bootstrap-gadget
+discovery, and payload generation. If the firmware layout is unrecognized,
+the bootstrap runs the stock executable unmodified; RTSP and ONVIF snapshots
+may require updated patches.
 
 ### Download an OTA from Tuya
 
@@ -104,22 +90,43 @@ With [uv](https://docs.astral.sh/uv/) installed, run:
 uv run tools/fetch_tuya_ota.py --email you@example.com --country 31
 ```
 
-Use your Smart Life account's country calling code. Enter the password at the
-hidden prompt and select your camera. The script downloads the offered main
-firmware to `build/ota/`, verifies available size/MD5 metadata, and prints its
-URL and SHA-256. No Android phone or Tuya developer account is needed.
+Use your account's country calling code, enter the password at the hidden
+prompt, and select a camera. The script downloads the offered firmware to
+`build/ota/`, checks available size/MD5 metadata, and prints its URL and SHA-256.
 
-If no OTA is offered, the script automatically fetches the device key through
-the same login session and temporarily reports the previous patch version
-(for example, `6.2712.42` instead of `6.2712.43`). It queries again and restores
-the original reported version before downloading; it never requests
-installation. If interrupted restoration leaves `build/ota/restore.json`,
-rerun with the same account and output directory to restore it first.
-Passwords, session tokens, and device keys are not saved.
+If no OTA is offered, it temporarily reports the previous patch version,
+queries again, and restores the original version before downloading. It never
+requests installation. If interrupted restoration leaves
+`build/ota/restore.json`, rerun with the same account and output directory.
 
-Share the resulting firmware or URL and its version/hash when requesting
-support. An available OTA may differ from the installed version; SD bootstrap
-still requires the exact installed firmware's `stone/main`.
+An offered OTA may differ from the installed firmware. SD bootstrap requires
+the exact installed firmware's `stone/main`.
+
+### Keep a camera awake from Smart Life
+
+```sh
+uv run tools/wake_tuya_camera.py --email you@example.com --country 31
+```
+
+Enter your password and select a camera, or pass `--device <device-id>`.
+The helper keeps the camera awake through a WebRTC preview session, discarding
+any media. Press **Ctrl+C** to disconnect and let it sleep. This consumes
+battery power like live viewing in the app; rerun if the connection drops.
+
+Requires a low-power camera with H.264 WebRTC support. Telnet, RTSP, and ONVIF
+also require the SD payload to be installed and running.
+
+### Reuse the Smart Life login
+
+For repeated use, keep `TUYA_EMAIL`, `TUYA_PASSWORD`, and `TUYA_COUNTRY` in
+the ignored repository-root `.env` file, with permissions set to `600`:
+
+```sh
+uv run --env-file .env tools/wake_tuya_camera.py
+uv run --env-file .env tools/fetch_tuya_ota.py
+```
+
+`--email` and `--country` override the saved values.
 
 ## Prerequisites
 
@@ -200,7 +207,7 @@ mkdir -p /tmp/lsc-solar-payload
 ./tools/build_tuya_dat_overflow.py --no-trigger /tmp/lsc-solar-payload
 ```
 
-Low-power/PIR wake mode is the default. To build a high-power test payload that
+Low-power/PIR wake mode is the default. To build a high-power payload that
 keeps the Linux side awake and uses the RTSP byte-motion fallback:
 
 ```sh
@@ -256,6 +263,7 @@ The SD bootstrap currently:
 tools/build_tuya_dat_overflow.py      SD payload builder
 tools/check_stone_compat.sh           offline firmware compatibility check
 tools/fetch_tuya_ota.py               Smart Life login and OTA downloader
+tools/wake_tuya_camera.py             Smart Life wake and preview keep-awake helper
 tools/push_camera_live.py             live network updater
 tools/compile.sh                      Docker based MIPS build
 tools/src/                            small camera-side helpers
