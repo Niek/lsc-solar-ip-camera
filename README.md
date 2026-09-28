@@ -96,6 +96,31 @@ launched, but RTSP data and patched ONVIF snapshots may depend on behavior that
 changed in that firmware. This is deliberately a fail-safe compatibility
 policy, not a guarantee that every future firmware can be patched automatically.
 
+### Download an OTA from Tuya
+
+With [uv](https://docs.astral.sh/uv/) installed, run:
+
+```sh
+uv run tools/fetch_tuya_ota.py --email you@example.com --country 31
+```
+
+Use your Smart Life account's country calling code. Enter the password at the
+hidden prompt and select your camera. The script downloads the offered main
+firmware to `build/ota/`, verifies available size/MD5 metadata, and prints its
+URL and SHA-256. No Android phone or Tuya developer account is needed.
+
+If no OTA is offered, the script automatically fetches the device key through
+the same login session and temporarily reports the previous patch version
+(for example, `6.2712.42` instead of `6.2712.43`). It queries again and restores
+the original reported version before downloading; it never requests
+installation. If interrupted restoration leaves `build/ota/restore.json`,
+rerun with the same account and output directory to restore it first.
+Passwords, session tokens, and device keys are not saved.
+
+Share the resulting firmware or URL and its version/hash when requesting
+support. An available OTA may differ from the installed version; SD bootstrap
+still requires the exact installed firmware's `stone/main`.
+
 ## Prerequisites
 
 - macOS or Linux host
@@ -230,6 +255,7 @@ The SD bootstrap currently:
 ```text
 tools/build_tuya_dat_overflow.py      SD payload builder
 tools/check_stone_compat.sh           offline firmware compatibility check
+tools/fetch_tuya_ota.py               Smart Life login and OTA downloader
 tools/push_camera_live.py             live network updater
 tools/compile.sh                      Docker based MIPS build
 tools/src/                            small camera-side helpers
