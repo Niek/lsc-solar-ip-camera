@@ -36,6 +36,19 @@ def unwrap(value):
     return value
 
 
+def debug_channel(channel):
+    """Keep firmware metadata and download URLs, excluding identity and keys."""
+    if not isinstance(channel, dict):
+        return {"unexpectedType": type(channel).__name__}
+    fields = (
+        "type", "typeDesc", "currentVersion", "version", "upgradeStatus",
+        "upgradeMode", "upgradeType", "devType", "canUpgrade", "remind",
+        "hasMore", "fileSize", "size", "md5", "url", "httpsUrl", "cdnUrl",
+    )
+    return {key: channel[key] for key in fields if key in channel
+            and (channel[key] is None or isinstance(channel[key], (str, int, float, bool)))}
+
+
 async def device_call(client, device_id, key, action, version, body):
     """Device HTTP protocol; mobile session tokens cannot sign these calls."""
     params = dict(a=action, et=1, t=int(time.time()), devId=device_id, v=version)
@@ -101,8 +114,10 @@ async def fallback(client, device_id, current, journal):
 
 
 async def run(args):
-    password = os.environ.get("TUYA_PASSWORD") or getpass.getpass("Smart Life password: ")
     journal = args.output / "restore.json"
+    if args.debug and journal.exists():
+        raise Error("Version restoration is pending. Rerun without --debug using the same output directory first.")
+    password = os.environ.get("TUYA_PASSWORD") or getpass.getpass("Smart Life password: ")
     async with aiohttp.ClientSession() as session:
         client = TuyaPasswordClient.for_application(
             TuyaMobileApp.SMART_LIFE, session, username=args.email, max_login_attempts=1)
@@ -129,6 +144,13 @@ async def run(args):
         metadata = unwrap(await client._call(
             "thing.m.device.upgrade.info", {"devId": device_id}, version="1.2"))
         channels = metadata if isinstance(metadata, list) else [metadata]
+        if args.debug:
+            print(json.dumps({
+                "api": "thing.m.device.upgrade.info",
+                "apiVersion": "1.2",
+                "channels": [debug_channel(c) for c in channels] if metadata is not None else [],
+            }, indent=2))
+            return
         offer = next((c for c in channels if isinstance(c, dict) and c.get("type") == 0), {})
         current = offer.get("currentVersion")
         print(f"Current firmware: {current or 'unknown'}")
@@ -166,6 +188,8 @@ def main():
                         help="account country calling code, e.g. 31")
     parser.add_argument("--device", help="device ID (otherwise choose from the account's device list)")
     parser.add_argument("--output", type=Path, default=Path("build/ota"))
+    parser.add_argument("--debug", action="store_true",
+                        help="print firmware metadata and URLs for all channels; do not change versions or download")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))
