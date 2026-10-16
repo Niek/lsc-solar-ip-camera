@@ -18,9 +18,18 @@ for the
 
 ## Compatibility
 
-Supports the Ingenic T23 based camera with firmware `6.2712.35` and
-`6.2712.43`. Other LSC/Tuya cameras may use different firmware layouts or
-boot behavior.
+Firmware `6.2712.35` and `6.2712.43` have been tested on live Ingenic T23
+cameras. Firmware `6.2163.49` for the solar PTZ model (article `3218152`)
+passes offline bootstrap and patch compatibility checks; live camera
+validation is still needed. The `.49` OTA and checksum are available in
+[issue #1](https://github.com/Niek/lsc-solar-ip-camera/issues/1#issuecomment-6200723690).
+This does not establish compatibility with `6.2163.48`.
+
+Patch locations are detected from instruction signatures, without selecting
+a version number or using fixed offsets. Matching firmware layouts can work
+automatically, but arbitrary firmware is not guaranteed: missing or ambiguous
+signatures are rejected. Other LSC/Tuya cameras may also use different hardware,
+boot hooks, or stream interfaces.
 
 ## Background
 
@@ -82,6 +91,11 @@ discovery, and payload generation. If the firmware layout is unrecognized,
 the bootstrap runs the stock executable unmodified; RTSP and ONVIF snapshots
 may require updated patches.
 
+Runtime detection applies after the SD bootstrap has gained execution. A fresh
+installation still needs the exact installed `stone/main` to generate `tuya.dat`:
+the stock parser needs a valid return address before our detection code can run.
+Do not use a `.49` trigger on `.48`, or try addresses from other versions.
+
 ### Download an OTA from Tuya
 
 With [uv](https://docs.astral.sh/uv/) installed, run:
@@ -101,6 +115,20 @@ requests installation. If interrupted restoration leaves
 
 An offered OTA may differ from the installed firmware. SD bootstrap requires
 the exact installed firmware's `stone/main`.
+
+Extract that executable from a downloaded T23 OTA package, then check it:
+
+```sh
+python3 tools/extract_stone_main.py \
+  build/ota/firmware-6.2163.49.bin build/ota/stone-main-6.2163.49
+./tools/check_stone_compat.sh build/ota/stone-main-6.2163.49
+```
+
+Replace the version in these paths with your downloaded version. The extractor
+checks the rootfs checksum and reads only `stone/main`; it does not install
+firmware or overwrite an existing output. It supports the JZLZMA OTA format
+verified in `6.2163.49` and `6.2712.43`, not arbitrary Tuya packages or raw flash
+dumps. Run `./tools/compile.sh` before the compatibility check.
 
 ### Keep a camera awake from Smart Life
 
@@ -262,6 +290,7 @@ The SD bootstrap currently:
 ```text
 tools/build_tuya_dat_overflow.py      SD payload builder
 tools/check_stone_compat.sh           offline firmware compatibility check
+tools/extract_stone_main.py           extract stock executable from a T23 OTA
 tools/fetch_tuya_ota.py               Smart Life login and OTA downloader
 tools/wake_tuya_camera.py             Smart Life wake and preview keep-awake helper
 tools/push_camera_live.py             live network updater

@@ -57,15 +57,20 @@ fi
 mkdir "$PAYLOAD"
 "$ROOT/tools/build_tuya_dat_overflow.py" --stone-main "$STONE" "$PAYLOAD"
 
-env PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT" "$STONE" "$PAYLOAD" <<'PY'
+env PYTHONDONTWRITEBYTECODE=1 python3 - "$ROOT" "$STONE" "$PAYLOAD" "$HOST_PATCHER" "$LOW_COPY" "$HIGH_COPY" <<'PY'
 import importlib.util
+import re
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
 stone = Path(sys.argv[2])
 payload_dir = Path(sys.argv[3])
+patcher = sys.argv[4]
+low_copy = Path(sys.argv[5])
+high_copy = Path(sys.argv[6])
 builder_path = root / "tools" / "build_tuya_dat_overflow.py"
 spec = importlib.util.spec_from_file_location("lsc_payload_builder", builder_path)
 builder = importlib.util.module_from_spec(spec)
@@ -73,6 +78,42 @@ assert spec.loader is not None
 spec.loader.exec_module(builder)
 
 data = stone.read_bytes()
+check = subprocess.run([patcher, "--check", str(stone)], check=True, capture_output=True, text=True)
+offset = int(re.search(r"low-power branch at 0x([0-9a-f]+)", check.stdout)[1], 16)
+stock_word = struct.unpack_from("<I", data, offset)[0]
+low_word = struct.unpack_from("<I", low_copy.read_bytes(), offset)[0]
+high_word = struct.unpack_from("<I", high_copy.read_bytes(), offset)[0]
+assert low_word == stock_word, "low-power mode changed the stock branch"
+if stock_word >> 16 == 0x1440:  # bne enters shutdown: remove the branch
+    assert high_word == 0
+elif stock_word >> 16 == 0x1040:  # beq skips shutdown: always take the same target
+    assert high_word == 0x10000000 | (stock_word & 0xffff)
+else:
+    raise SystemExit(f"unexpected stock low-power branch: 0x{stock_word:08x}")
+
+for copy, options in ((low_copy, ["--keep-low-power"]), (high_copy, [])):
+    before = copy.read_bytes()
+    subprocess.run([patcher, *options, str(copy)], check=True, capture_output=True)
+    assert copy.read_bytes() == before, "patching twice changed the binary"
+
+def reject_patch(label, mutated):
+    path = payload_dir / "negative-test-main"
+    path.write_bytes(mutated)
+    for options in (["--check"], ["--keep-low-power"], []):
+        result = subprocess.run([patcher, *options, str(path)], capture_output=True)
+        assert result.returncode != 0, f"{label} unexpectedly accepted"
+        assert path.read_bytes() == mutated, f"{label} modified before rejection"
+    path.unlink()
+
+mutated = bytearray(data)
+struct.pack_into("<I", mutated, offset, 0x03e00008)  # jr ra is never a supported decision
+reject_patch("unknown low-power instruction", mutated)
+if stock_word >> 16 == 0x1040:
+    mutated = bytearray(data)
+    struct.pack_into("<I", mutated, offset, stock_word + 1)  # wrong skip destination
+    reject_patch("changed low-power skip target", mutated)
+print("power modes, idempotence, and rejection without writes: passed")
+
 builder.validate_tuya_overflow_layout(data, stone)
 gadget = builder.discover_system_sp20_gadget(stone)
 

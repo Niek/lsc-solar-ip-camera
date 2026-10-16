@@ -29,6 +29,7 @@ typedef struct {
     off_t snapshot_offset;
     uint32_t snapshot_target_vaddr;
     uint32_t low_power_word;
+    uint32_t low_power_disabled_word;
     int snapshot_is_patched;
     uint8_t snapshot_patch[SNAPSHOT_PATCH_WORDS * 4];
 } PatchLayout;
@@ -55,6 +56,41 @@ static const WordPattern low_power_context[] = {
     {0x14510000U, 0xffff0000U}, /* bne v0,s1,... */
     {0x00000000U, 0xffffffffU}, /* nop */
     {0x0c000000U, 0xfc000000U}, /* jal ... */
+    {0x24040005U, 0xffffffffU}, /* li a0,5 */
+};
+
+/*
+ * The 6.2163.49 suspend loop branches over shutdown when the decision returns
+ * zero. Disable shutdown by making that branch unconditional, keeping its
+ * discovered displacement. The patch site is word 10; its target is checked
+ * separately so a changed shutdown layout is not silently accepted.
+ */
+static const WordPattern low_power_skip_context[] = {
+    {0x82020064U, 0xffffffffU}, /* lb v0,0x64(s0) */
+    {0x10520000U, 0xffff0000U}, /* beq v0,s2,... */
+    {0x00000000U, 0xffffffffU}, /* nop */
+    {0x8202006cU, 0xffffffffU}, /* lb v0,0x6c(s0) */
+    {0x10520000U, 0xffff0000U}, /* beq v0,s2,... */
+    {0x00000000U, 0xffffffffU}, /* nop */
+    {0x0c000000U, 0xfc000000U}, /* jal ... */
+    {0x00000000U, 0xffffffffU}, /* nop */
+    {0x0c000000U, 0xfc000000U}, /* jal low-power decision */
+    {0x00000000U, 0xffffffffU}, /* nop */
+    {0x00000000U, 0x00000000U}, /* beq v0,zero,... or patched b */
+    {0x00000000U, 0xffffffffU}, /* nop */
+    {0x0c000000U, 0xfc000000U}, /* jal ... */
+    {0xae120054U, 0xffffffffU}, /* sw s2,0x54(s0) */
+    {0x0c000000U, 0xfc000000U}, /* jal ... */
+    {0x00002025U, 0xffffffffU}, /* move a0,zero */
+    {0x0c000000U, 0xfc000000U}, /* jal ... */
+    {0x00002025U, 0xffffffffU}, /* move a0,zero */
+};
+
+static const WordPattern low_power_skip_target[] = {
+    {0x0c000000U, 0xfc000000U}, /* jal sleep */
+    {0x24040001U, 0xffffffffU}, /* li a0,1 */
+    {0x82020043U, 0xffffffffU}, /* lb v0,0x43(s0) */
+    {0x14520000U, 0xffff0000U}, /* bne v0,s2,... */
     {0x24040005U, 0xffffffffU}, /* li a0,5 */
 };
 
@@ -294,13 +330,50 @@ static int build_snapshot_patch(uint8_t *patch, uint32_t callback_vaddr,
     return 0;
 }
 
-static int is_low_power_branch(uint32_t word) {
-    return (word & 0xffff0000U) == 0x14400000U;
+static int analyze_low_power(const uint8_t *data, size_t size, const char *path,
+                             PatchLayout *layout) {
+    off_t enter_offset = 0;
+    off_t skip_offset = 0;
+    size_t enter_count = count_word_pattern(
+        data, size, low_power_context,
+        sizeof(low_power_context) / sizeof(low_power_context[0]), &enter_offset);
+    size_t skip_count = count_word_pattern(
+        data, size, low_power_skip_context,
+        sizeof(low_power_skip_context) / sizeof(low_power_skip_context[0]), &skip_offset);
+    uint32_t stock_opcode;
+
+    if (enter_count + skip_count != 1) {
+        fprintf(stderr, "%s: expected one low-power control-flow signature, found %lu\n",
+                path, (unsigned long)(enter_count + skip_count));
+        return 1;
+    }
+    layout->low_power_offset = enter_count ? enter_offset + 6 * 4 : skip_offset + 10 * 4;
+    layout->low_power_word = read_u32_le(data + layout->low_power_offset);
+    stock_opcode = enter_count ? 0x14400000U : 0x10400000U;
+    layout->low_power_disabled_word = enter_count ? 0 :
+        0x10000000U | (layout->low_power_word & 0xffffU);
+    if (layout->low_power_word != layout->low_power_disabled_word &&
+        (layout->low_power_word & 0xffff0000U) != stock_opcode) {
+        fprintf(stderr, "%s: unexpected low-power instruction 0x%08x at 0x%lx\n",
+                path, layout->low_power_word, (long)layout->low_power_offset);
+        return 1;
+    }
+    if (skip_count) {
+        off_t target = layout->low_power_offset + 4 +
+            (off_t)(int16_t)(layout->low_power_word & 0xffffU) * 4;
+        size_t target_size = sizeof(low_power_skip_target) / sizeof(WordPattern) * 4;
+        if (target <= layout->low_power_offset || (uint64_t)target + target_size > size ||
+            count_word_pattern(data + target, target_size, low_power_skip_target,
+                               target_size / 4, NULL) != 1) {
+            fprintf(stderr, "%s: unrecognized low-power skip target\n", path);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int analyze_layout(const uint8_t *data, size_t size, const char *path,
                           PatchLayout *layout) {
-    off_t low_context_offset;
     off_t original_snapshot_offset = 0;
     off_t target_offset;
     uint32_t callback_vaddr;
@@ -309,16 +382,7 @@ static int analyze_layout(const uint8_t *data, size_t size, const char *path,
     if (validate_elf32_mips(data, size, path) != 0) {
         return 1;
     }
-    if (find_unique_word_pattern(data, size, low_power_context,
-                                 sizeof(low_power_context) / sizeof(low_power_context[0]),
-                                 path, "low-power control-flow", &low_context_offset) != 0) {
-        return 1;
-    }
-    layout->low_power_offset = low_context_offset + (6 * 4);
-    layout->low_power_word = read_u32_le(data + layout->low_power_offset);
-    if (layout->low_power_word != 0 && !is_low_power_branch(layout->low_power_word)) {
-        fprintf(stderr, "%s: unexpected low-power instruction 0x%08x at 0x%lx\n",
-                path, layout->low_power_word, (long)layout->low_power_offset);
+    if (analyze_low_power(data, size, path, layout) != 0) {
         return 1;
     }
 
@@ -402,7 +466,7 @@ static int apply_layout(int fd, const char *path, const PatchLayout *layout,
     uint8_t word_bytes[4];
     uint32_t target_low_power;
 
-    target_low_power = keep_low_power ? layout->low_power_word : 0;
+    target_low_power = keep_low_power ? layout->low_power_word : layout->low_power_disabled_word;
     if (layout->low_power_word != target_low_power) {
         write_u32_le(word_bytes, target_low_power);
         if (write_exact(fd, layout->low_power_offset, word_bytes, sizeof(word_bytes)) < 0) {
@@ -474,7 +538,7 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    if (keep_low_power && layout.low_power_word == 0) {
+    if (keep_low_power && layout.low_power_word == layout.low_power_disabled_word) {
         fprintf(stderr,
                 "%s: cannot reconstruct the stock low-power branch; recopy the stock executable\n",
                 path);
@@ -485,7 +549,7 @@ int main(int argc, char **argv) {
 
     printf("%s: discovered low-power branch at 0x%lx (%s)\n",
            path, (long)layout.low_power_offset,
-           layout.low_power_word == 0 ? "disabled" : "enabled");
+           layout.low_power_word == layout.low_power_disabled_word ? "disabled" : "enabled");
     printf("%s: discovered snapshot callback at 0x%lx (%s), target 0x%08x\n",
            path, (long)layout.snapshot_offset,
            layout.snapshot_is_patched ? "patched" : "stock",
